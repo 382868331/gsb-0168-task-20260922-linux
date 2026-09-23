@@ -16,7 +16,16 @@
 * 存活发送者的已发位历史必然相同（否则已在该位分出胜负/报错），
   因此它们的填充位置天然对齐，逐位按各自 stream[i] 比较即可。
 
-本模型不实现重传、错误界定/被动错误计数、错误界定符等完整 CAN 机制。
+错误计数（TEC/REC，本题契约）由 ErrorTracker 跨多次传输持久跟踪：
+
+* 发送错误：本轮仍活跃的发送者被错误帧中止 -> TEC += 8
+* 接收错误：已退出仲裁的节点观察到错误帧 -> REC += 1
+* 发送/接收成功：对应计数 -= 1（到 0 为止，不为负）
+* 仲裁丢失本身不是错误，不改变任何计数
+* TEC 或 REC 达到 128 -> error passive；TEC 达到 256 -> bus-off
+* bus-off 节点禁止作为发送者；仅显式 reset 清零恢复
+
+本模型仍不实现重传、被动错误标志区别、错误界定符等完整 CAN 机制。
 """
 
 from __future__ import annotations
@@ -34,6 +43,127 @@ from .framing import (
 )
 
 ERROR_FLAG_BITS = 6
+
+# ---- 错误计数契约常量 -----------------------------------------------------
+
+TX_ERROR_PENALTY = 8   # 发送错误：TEC 增量
+RX_ERROR_PENALTY = 1   # 接收错误：REC 增量
+ERROR_PASSIVE_THRESHOLD = 128  # TEC 或 REC 达到即进入 error passive
+BUS_OFF_THRESHOLD = 256        # TEC 达到即 bus-off
+
+STATE_ACTIVE = "active"
+STATE_PASSIVE = "passive"
+STATE_BUS_OFF = "bus_off"
+
+
+@dataclass(frozen=True)
+class ErrorStateSnapshot:
+    """某节点某一时刻的错误计数快照。"""
+
+    tec: int
+    rec: int
+    state: str  # "active" | "passive" | "bus_off"
+
+
+class ErrorTracker:
+    """跨多次 BitBus 传输持久跟踪各节点的 TEC/REC 与错误状态。
+
+    计数规则（本题契约）：
+
+    * 发送错误（本轮仍活跃的发送者被错误帧中止）：TEC += 8
+    * 接收错误（已退出仲裁的节点观察到错误帧）：REC += 1
+    * 发送成功：TEC -= 1（下限 0）；接收成功：REC -= 1（下限 0）
+    * 仲裁丢失不是错误，不改变任何计数
+    * TEC 或 REC >= 128 -> passive；TEC >= 256 -> bus-off（锁定）
+    * bus-off 节点禁止作为 BitBus 发送者；仅显式 reset() 清零恢复
+
+    状态判定：bus-off 为锁定标志（仅 reset 解除）；active/passive 由当前
+    计数实时导出，计数回落到阈值以下即自动回到 active。
+    """
+
+    def __init__(self, names: Iterable[str] = ()) -> None:
+        self._nodes: dict[str, dict[str, object]] = {}
+        for n in names:
+            self.register(n)
+
+    @staticmethod
+    def _check_name(name: object, field: str = "name") -> str:
+        if not isinstance(name, str) or not name:
+            raise ValidationError("node name must be a non-empty str", field)
+        return name
+
+    def register(self, name: str) -> None:
+        """登记节点（幂等）；已登记节点计数不变。"""
+        self._check_name(name)
+        self._nodes.setdefault(name, {"tec": 0, "rec": 0, "bus_off": False})
+
+    def is_registered(self, name: str) -> bool:
+        self._check_name(name)
+        return name in self._nodes
+
+    def _entry(self, name: str) -> dict[str, object]:
+        self._check_name(name)
+        try:
+            return self._nodes[name]
+        except KeyError:
+            raise ValidationError(f"unknown node {name!r}", "name") from None
+
+    def tec(self, name: str) -> int:
+        return int(self._entry(name)["tec"])
+
+    def rec(self, name: str) -> int:
+        return int(self._entry(name)["rec"])
+
+    def state(self, name: str) -> str:
+        e = self._entry(name)
+        if e["bus_off"]:
+            return STATE_BUS_OFF
+        if (
+            int(e["tec"]) >= ERROR_PASSIVE_THRESHOLD
+            or int(e["rec"]) >= ERROR_PASSIVE_THRESHOLD
+        ):
+            return STATE_PASSIVE
+        return STATE_ACTIVE
+
+    def snapshot(self, name: str) -> ErrorStateSnapshot:
+        e = self._entry(name)
+        return ErrorStateSnapshot(
+            tec=int(e["tec"]), rec=int(e["rec"]), state=self.state(name)
+        )
+
+    def snapshots(self) -> dict[str, ErrorStateSnapshot]:
+        """所有已登记节点的快照（按登记顺序）。"""
+        return {n: self.snapshot(n) for n in self._nodes}
+
+    def reset(self, name: str | None = None) -> None:
+        """显式复位：计数清零、解除 bus-off。name=None 复位全部节点。"""
+        if name is not None:
+            self._entry(name).update(tec=0, rec=0, bus_off=False)
+        else:
+            for e in self._nodes.values():
+                e.update(tec=0, rec=0, bus_off=False)
+
+    # ---- 由 BitBus 驱动的计数事件（契约规则，非公开 API） ------------------
+
+    def _tx_error(self, name: str) -> None:
+        e = self._entry(name)
+        e["tec"] = int(e["tec"]) + TX_ERROR_PENALTY
+        if int(e["tec"]) >= BUS_OFF_THRESHOLD:
+            e["bus_off"] = True
+
+    def _rx_error(self, name: str) -> None:
+        e = self._entry(name)
+        e["rec"] = int(e["rec"]) + RX_ERROR_PENALTY
+
+    def _tx_success(self, name: str) -> None:
+        e = self._entry(name)
+        if int(e["tec"]) > 0:
+            e["tec"] = int(e["tec"]) - 1
+
+    def _rx_success(self, name: str) -> None:
+        e = self._entry(name)
+        if int(e["rec"]) > 0:
+            e["rec"] = int(e["rec"]) - 1
 
 
 @dataclass(frozen=True)
@@ -122,6 +252,12 @@ class BitBus:
         forced_bits:  位索引 -> 线上被外力强制的电平（0/1），与所有驱动者
                       线与。用于确定性地注入故障（如破坏填充位）；
                       例如在某发送 1 的位置强制 0 -> 该发送者发 1 读 0
+        error_tracker: 可选 ErrorTracker。给出时：构造期校验所有发送者
+                      均未 bus-off（否则 ValidationError，不产生任何计数
+                      变更）；本轮结束时按契约更新 TEC/REC（错误帧中止：
+                      活跃发送者 TEC+8、已退出仲裁者 REC+1；成功完成：
+                      活跃发送者 TEC-1、已退出仲裁者 REC-1，下限 0）。
+                      未登记的发送者名自动登记。
     """
 
     def __init__(
@@ -130,6 +266,7 @@ class BitBus:
         *,
         ack_pullers: Iterable[str] = (),
         forced_bits: dict[int, int] | None = None,
+        error_tracker: ErrorTracker | None = None,
     ) -> None:
         senders = list(senders)
         if not senders:
@@ -169,14 +306,37 @@ class BitBus:
                     )
                 forced[idx] = val
 
+        if error_tracker is not None and not isinstance(error_tracker, ErrorTracker):
+            raise ValidationError(
+                f"error_tracker must be ErrorTracker, got "
+                f"{type(error_tracker).__name__}",
+                "error_tracker",
+            )
+        if error_tracker is not None:
+            # 先整体校验 bus-off，再登记新名字：拒绝时不产生任何状态变更
+            for s in senders:
+                if (
+                    error_tracker.is_registered(s.name)
+                    and error_tracker.state(s.name) == STATE_BUS_OFF
+                ):
+                    raise ValidationError(
+                        f"sender {s.name!r} is bus-off and may not transmit; "
+                        f"call error_tracker.reset() to recover",
+                        "senders",
+                    )
+            for s in senders:
+                error_tracker.register(s.name)
+
         self._senders = senders
         self._ack_pullers = pullers
         self._forced = forced
+        self._tracker = error_tracker
         self._enc: dict[str, EncodedFrame] = {
             s.name: encode_frame(s.frame) for s in senders
         }
 
         self._active: set[str] = set(names)
+        self._lost: list[str] = []  # 本轮已退出仲裁的节点（按退出顺序）
         self._pos = 0
         self._phase: str = "transmit"  # transmit|ack|eof|error|done
         self._error_to_go = 0
@@ -215,6 +375,11 @@ class BitBus:
     @property
     def error_frame(self) -> ErrorFrameInfo | None:
         return self._error_info
+
+    @property
+    def error_tracker(self) -> ErrorTracker | None:
+        """构造时传入的 ErrorTracker（未传入为 None）。"""
+        return self._tracker
 
     def encoded_stream(self, sender_name: str) -> EncodedFrame:
         """查看某参与者的编码产物（含填充位映射），便于定位演示。"""
@@ -283,6 +448,7 @@ class BitBus:
         if losers:
             for name in losers:
                 self._active.discard(name)
+                self._lost.append(name)
                 self._events.append(
                     Event(
                         i,
@@ -318,6 +484,12 @@ class BitBus:
                 Event(i, "complete", bus, tuple(self._active_ordered()),
                       "frame completed successfully")
             )
+            if self._tracker is not None:
+                # 发送成功：胜者 TEC-1；已退出仲裁者接收成功 REC-1（下限 0）
+                for name in self._active_ordered():
+                    self._tracker._tx_success(name)
+                for name in self._lost:
+                    self._tracker._rx_success(name)
             out_phase = "done"
         else:
             if not losers:
@@ -358,6 +530,13 @@ class BitBus:
         self._phase = "error"
         self._error_to_go = ERROR_FLAG_BITS
         self._pos += 1
+        if self._tracker is not None:
+            # 发送错误：被中止的活跃发送者 TEC+8；
+            # 接收错误：已退出仲裁的节点观察到错误帧 REC+1
+            for name in aborted:
+                self._tracker._tx_error(name)
+            for name in self._lost:
+                self._tracker._rx_error(name)
 
     def _step_error_flag(self) -> StepResult:
         i = self._pos

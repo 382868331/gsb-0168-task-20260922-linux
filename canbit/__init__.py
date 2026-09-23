@@ -2,7 +2,9 @@
 
 本库只实现题目定义的有限协议子集：11 位 ID、4 位 DLC(0..8)、
 0..8 字节数据、15 位 CRC（多项式 0x4599，初值 0）、ID..CRC 区段的
-位填充、独立 ACK 槽，以及逐 bit 的总线仲裁/错误帧模型。
+位填充、独立 ACK 槽、逐 bit 的总线仲裁/错误帧模型，以及跨传输持久
+的 TEC/REC 错误计数（ErrorTracker：+8/+1/-1、128 被动、TEC 256 离线、
+显式复位）。
 
 不宣称兼容完整 CAN 标准。
 """
@@ -32,9 +34,19 @@ from .framing import (
     payload_bits,
 )
 from .bus import (
+    BUS_OFF_THRESHOLD,
+    ERROR_FLAG_BITS,
+    ERROR_PASSIVE_THRESHOLD,
+    RX_ERROR_PENALTY,
+    STATE_ACTIVE,
+    STATE_BUS_OFF,
+    STATE_PASSIVE,
+    TX_ERROR_PENALTY,
     BitBus,
     BusResult,
     ErrorFrameInfo,
+    ErrorStateSnapshot,
+    ErrorTracker,
     Event,
     Sender,
     StepResult,
@@ -48,6 +60,15 @@ __all__ = [
     "CRC_MASK",
     "MAX_DATA_LEN",
     "POLYNOMIAL",
+    # 错误计数常量
+    "TX_ERROR_PENALTY",
+    "RX_ERROR_PENALTY",
+    "ERROR_PASSIVE_THRESHOLD",
+    "BUS_OFF_THRESHOLD",
+    "ERROR_FLAG_BITS",
+    "STATE_ACTIVE",
+    "STATE_PASSIVE",
+    "STATE_BUS_OFF",
     # 数据结构
     "Frame",
     "EncodedFrame",
@@ -57,6 +78,7 @@ __all__ = [
     "StepResult",
     "ErrorFrameInfo",
     "BusResult",
+    "ErrorStateSnapshot",
     # 编解码
     "compute_crc15",
     "payload_bits",
@@ -64,8 +86,9 @@ __all__ = [
     "destuff_bits",
     "encode_frame",
     "decode_frame",
-    # 总线
+    # 总线与错误计数
     "BitBus",
+    "ErrorTracker",
     # 异常
     "CanError",
     "ValidationError",

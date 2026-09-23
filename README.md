@@ -1,10 +1,12 @@
-# canbit — CAN 合成位流的仲裁与错误约束（本题契约子集）
+# canbit — CAN 合成位流的仲裁、错误约束与错误计数（本题契约子集）
 
 一个零依赖的离线 Python 题库，对**有限定义**的 CAN 风格总线做逐 bit 建模：
-帧编码、CRC15、位填充、wired-AND 仲裁、位错误、显式 ACK 槽与错误帧中止。
+帧编码、CRC15、位填充、wired-AND 仲裁、位错误、显式 ACK 槽、错误帧中止，
+以及跨多次传输持久的 **TEC/REC 错误计数**（发送错误 +8、接收错误 +1、
+成功 −1 到零、任一计数 128 进被动、TEC 256 离线、显式复位清零）。
 
 > **本库只实现题面契约定义的有限协议子集，不宣称兼容完整 CAN 标准**
-> （无 RTR/IDE/控制场其余位、无重传、无错误界定/被动错误计数、无位时序
+> （无 RTR/IDE/控制场其余位、无重传、无被动错误标志区别、无位时序
 > 与同步、无错误界定符/帧间隙等）。
 
 ## 运行环境
@@ -17,10 +19,10 @@
 ## 准确命令
 
 ```bash
-# 必要测试（37 个用例，实测 < 0.1s）
+# 必要测试（57 个用例，实测 < 0.1s）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（实测约 0.04s，远小于 8s 预算；无 sleep、无预录结果）
+# 固定输入演示（实测约 0.1s，远小于 90s 预算；无 sleep、无预录结果）
 python demo.py
 ```
 
@@ -41,6 +43,13 @@ python demo.py
 | ACK | 所有发送者在 ACK 槽释放（发 1）；总线是否被拉低**完全由显式参数 `ack_pullers` 决定**；无任何接收者拉低则仍在发送者报 `ack_error` |
 | 错误帧 | 检测到错误的那个位时间即中止当前传输，检测者随后发 **6 位显性错误标志**；`ErrorFrameInfo` 记录触发类型、位索引、检测者与被中止的全部参与者 |
 | CRC 检查时机 | 接收/解码视角先去填充，再切字段，再校验 CRC；填充错误先于 CRC 报告 |
+| 发送错误计数 | 本轮仍活跃的发送者被错误帧中止：该节点 **TEC += 8** |
+| 接收错误计数 | 已退出仲裁的节点观察到错误帧：该节点 **REC += 1** |
+| 成功计数 | 发送成功 TEC −= 1、接收成功 REC −= 1，**下限 0 不为负** |
+| 仲裁丢失 | **不是错误**，不改变任何计数 |
+| 错误被动 | TEC 或 REC **任一达到 128** 即进入 `passive`；计数回落到阈值以下自动回 `active` |
+| 离线 | TEC **达到 256** 即 `bus_off`（REC 不会导致离线）；离线节点**禁止作为发送者**，构造 `BitBus` 即抛 `ValidationError` |
+| 复位 | 仅**显式** `ErrorTracker.reset()` 清零计数并解除离线；无自动恢复 |
 
 ## 公开接口
 
@@ -52,6 +61,8 @@ from canbit import (
     DecodedFrame,         # decode_frame 的产物（frame/crc/crc_ok）
     Sender,               # Sender(name:str, frame:Frame)
     BitBus, Event, StepResult, ErrorFrameInfo, BusResult,
+    ErrorTracker,         # 跨传输持久的 TEC/REC 错误计数器
+    ErrorStateSnapshot,   # (tec, rec, state) 快照
     # 纯函数
     compute_crc15,        # (identifier, dlc, data) -> int 0..0x7FFF
     payload_bits,         # (identifier, dlc, data) -> list[int]
@@ -59,6 +70,11 @@ from canbit import (
     encode_frame, decode_frame,
     # 常量
     ID_BITS, DLC_BITS, CRC_BITS, MAX_DATA_LEN, POLYNOMIAL,
+    TX_ERROR_PENALTY,     # 8    发送错误 TEC 增量
+    RX_ERROR_PENALTY,     # 1    接收错误 REC 增量
+    ERROR_PASSIVE_THRESHOLD,  # 128  任一计数达到即被动
+    BUS_OFF_THRESHOLD,        # 256  TEC 达到即离线
+    STATE_ACTIVE, STATE_PASSIVE, STATE_BUS_OFF,
 )
 from canbit.errors import (
     CanError, ValidationError, FrameDecodeError, BusFinishedError,
@@ -91,6 +107,28 @@ dec = decode_frame(stuffed, raise_on_crc=False)     # CRC 错不抛，返回 crc
 # FrameDecodeError.bit_index：填充后流的 0 基索引（可定位）
 ```
 
+错误计数（新增能力，`error_tracker` 为可选参数，不传则行为与旧版完全一致）：
+
+```python
+tracker = ErrorTracker()                 # 跨多次传输持久持有
+bus = BitBus([Sender("A", Frame(0x123, b"q"))],
+             error_tracker=tracker)      # 无人 ACK -> ack_error
+bus.run()
+tracker.tec("A")                         # 8（发送错误 +8）
+tracker.state("A")                       # "active" | "passive" | "bus_off"
+tracker.snapshot("A")                    # ErrorStateSnapshot(tec=8, rec=0, state='active')
+
+# TEC 到 256 离线后，该节点再作为发送者构造 BitBus 即抛 ValidationError；
+# 显式复位清零恢复：
+tracker.reset("A")                       # 或 tracker.reset() 复位全部节点
+```
+
+计数更新时机：一轮传输**结束的那个位时间**（错误帧开始 / EOF 完成）恰好
+更新一次，与逐步 `step()` 或一次性 `run()` 的驱动方式无关。`ack_pullers`
+是“拉线”实体而非节点，不参与计数；只有发送者（含仲裁失败转为接收的
+节点）被跟踪。未登记的发送者名在构造 `BitBus` 时自动登记；
+`tec/rec/state/snapshot/reset` 对未登记名字抛 `ValidationError`。
+
 ## 输入上限与错误语义
 
 * ID ∈ [0, 2047]；DLC ∈ [0, 8]；数据长度必须等于 DLC（直接调用 CRC/payload
@@ -100,9 +138,14 @@ dec = decode_frame(stuffed, raise_on_crc=False)     # CRC 错不抛，返回 crc
 * 非法输入立即抛 `ValidationError`（消息带 `field=...` 可定位），**不静默
   纠正、不截断、不隐式转换**。
 * `BitBus` 为一次性本轮传输对象：结束后再 `step()` 抛 `BusFinishedError`；
-  未结束调 `result()` 抛 `ValidationError`。构造期完成全部校验，运行期不会
-  因输入问题产生半完成状态；`run()` 要么得到完整结果，要么得到带
-  `ErrorFrameInfo` 的完整错误帧记录，不存在未说明的部分变更。
+  未结束调 `result()` 抛 `ValidationError`。构造期完成全部校验（含
+  bus-off 发送者拒绝），运行期不会因输入问题产生半完成状态；`run()`
+  要么得到完整结果，要么得到带 `ErrorFrameInfo` 的完整错误帧记录，
+  不存在未说明的部分变更。bus-off 拒绝发生在任何计数变更**之前**，
+  被拒绝的构造不会改动 `ErrorTracker` 里任何节点的计数。
+* 错误计数只在一轮传输结束时更新一次（见上节），不存在“计了一半
+  的错误”：`BitBus` 对象本身是一次性的，中断的 `step()` 序列只要没
+  走到结束位就不会触碰计数器。
 * 本库无“搜索预算/无解”类算法，故不存在预算耗尽与无解混淆的情形。
 
 ## 浮点 / 误差口径
@@ -124,15 +167,24 @@ NaN/Infinity）一律拒绝，不参与任何数值运算。测试中不存在�
 4. **ACK 显式化**：不模拟自动应答；接收者是否拉低完全由 `ack_pullers`
    给定，名字可以是任意参与者（仲裁失败者、纯接收者均可）。
 5. **错误帧固定 6 位显性标志**：只表达“中止 + 谁报的 + 在哪一位”，不实现
-   错误界定符、错误计数与重传。
-6. **可审计**：每个位时间产生一条 `Event`；错误位置同时给出填充后流
+   错误界定符、被动错误标志区别与重传。
+6. **错误计数挂在 tracker 上而非总线上**：`BitBus` 是一次性对象，TEC/REC
+   必须跨轮持久，故由调用方持有 `ErrorTracker` 并作为可选参数传入；不传
+   时没有任何计数开销与行为差异（旧代码零改动兼容）。计数规则按题面
+   简化为：被中止的活跃发送者 TEC+8、已退出仲裁者 REC+1、成功各 −1
+   （下限 0）；不区分“谁检测到的错误”，也不实现 REC 的 119..127 迟滞
+   等完整 CAN 细节。
+7. **可审计**：每个位时间产生一条 `Event`；错误位置同时给出填充后流
    0 基索引，便于和 `EncodedFrame.stuffing_map` 对照定位。
 
 ## 已知限制
 
 * 不是完整 CAN/CAN FD：无 RTR、IDE、保留位、控制场其余编码、远程帧、
   过载帧、帧间隙、位时序/同步、重同步跳转宽度。
-* 无重传、无主动/被动错误/总线关闭状态机、无错误界定符与错误计数。
+* 无重传、无主动/被动错误标志区别、无错误界定符；bus-off 恢复仅靠
+  显式 `reset()`，不实现完整 CAN 的 128×11 隐性位自动恢复。
+* 错误计数为节点级账本（见“协议契约”表），不模拟计数对总线行为的
+  反作用（如被动节点延后发送）；`ack_pullers` 不参与计数。
 * ACK 槽为 1 位模型，不区分 ACK 槽/界定符；EOF 为 1 位而非 7 位。
 * `forced_bits` 是测试/演示用的确定性故障注入钩子，不代表真实收发器行为。
 * DLC 仅 0..8；解码出 DLC>8 直接报 `protocol` 错误（不做经典 CAN 的
@@ -144,9 +196,10 @@ NaN/Infinity）一律拒绝，不参与任何数值运算。测试中不存在�
 canbit/__init__.py     # 公开导出
 canbit/errors.py       # CanError/ValidationError/FrameDecodeError/BusFinishedError
 canbit/framing.py      # Frame/CRC15/位填充/整帧编码与解码
-canbit/bus.py          # BitBus：逐 bit 仲裁/位错误/ACK/错误帧
+canbit/bus.py          # BitBus：逐 bit 仲裁/位错误/ACK/错误帧；ErrorTracker：TEC/REC
 tests/test_framing.py  # CRC、填充、编解码测试（对照独立参考）
 tests/test_bus.py      # 仲裁/错误/ACK/契约/差分对拍测试
+tests/test_error_state.py  # TEC/REC 计数、阈值、离线、复位测试（手算期望值）
 tests/reference.py     # 独立参考实现（不 import canbit）
 demo.py                # 固定输入演示
 ```

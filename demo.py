@@ -8,10 +8,12 @@
   2. 同 ID 不同负载 —— 独立编码产物不同（CRC/位流对比）
   3. 填充位被外力破坏 —— 真实定位首个填充位并仿真错误帧中止
   4. CRC 被篡改 + 非法输入边界 —— 解码异常与输入拒绝真实触发
+  5. TEC/REC 错误计数 —— +8/+1/-1、128 被动、256 离线、复位恢复
 """
 
 from canbit import (
     BitBus,
+    ErrorTracker,
     Frame,
     Sender,
     bit_stuff,
@@ -134,9 +136,54 @@ def main() -> None:
         else:  # pragma: no cover - demo 不应走到这里
             raise AssertionError(f"illegal input was silently accepted: {label}")
 
+    # -----------------------------------------------------------------
+    # 场景 5：TEC/REC 错误计数 —— 被动、离线、禁止发送、复位恢复
+    # -----------------------------------------------------------------
+    hr("场景 5（错误计数）：TEC/REC 跨传输累积与状态机")
+    tracker = ErrorTracker()
+    print("ECU_A 单独发送且无人 ACK -> 每轮 ack_error，TEC += 8：")
+    for k in range(1, 33):
+        BitBus([Sender("ECU_A", Frame(0x123, b"q"))],
+               error_tracker=tracker).run()
+        if k in (1, 15, 16, 31, 32):
+            s = tracker.snapshot("ECU_A")
+            print(f"  第 {k:>2} 轮后: TEC={s.tec:>3} REC={s.rec} 状态={s.state}")
+    print("-> TEC 到 128 进入被动，到 256 离线（阈值均为运行时真实判定）")
+
+    print("离线节点尝试发送：")
+    try:
+        BitBus([Sender("ECU_A", Frame(0x123))], error_tracker=tracker)
+    except ValidationError as exc:
+        print(f"  拒绝 -> {type(exc).__name__}: {exc}")
+
+    print("显式复位后重新发送（有接收者 ACK，发送成功 TEC-1）：")
+    tracker.reset("ECU_A")
+    # 先积累少量计数再演示成功递减
+    for _ in range(3):
+        BitBus([Sender("ECU_A", Frame(0x123, b"q"))],
+               error_tracker=tracker).run()
+    print(f"  复位后再遇 3 次 ack_error: TEC={tracker.tec('ECU_A')}")
+    for k in range(1, 4):
+        BitBus([Sender("ECU_A", Frame(0x123, b"q"))],
+               ack_pullers={"RX_node"}, error_tracker=tracker).run()
+        print(f"  第 {k} 次成功发送后: TEC={tracker.tec('ECU_A')} "
+              f"状态={tracker.state('ECU_A')}")
+
+    print("接收方向：ECU_A(0x7FF) 仲裁必输，随后总线被外力破坏 -> REC += 1：")
+    tracker.reset()
+    frame_b = Frame(0x000, b"\xFF")
+    enc_b = encode_frame(frame_b)
+    target = next(i for i in range(13, enc_b.ack_index) if enc_b.stream[i] == 1)
+    BitBus([Sender("ECU_A", Frame(0x7FF)), Sender("ECU_B", frame_b)],
+           forced_bits={target: 0}, error_tracker=tracker).run()
+    sa, sb = tracker.snapshot("ECU_A"), tracker.snapshot("ECU_B")
+    print(f"  ECU_A（仲裁失败转为接收）: TEC={sa.tec} REC={sa.rec} 状态={sa.state}")
+    print(f"  ECU_B（活跃发送被中止）:   TEC={sb.tec} REC={sb.rec} 状态={sb.state}")
+    print("-> 仲裁丢失本身不计错；接收错误 +1，发送错误 +8")
+
     hr("演示结束")
     print("所有结果均为运行时真实计算；本模型仅实现本题契约子集，")
-    print("不包含重传、错误界定/被动错误计数等完整 CAN 机制。")
+    print("不包含重传、被动错误标志区别、错误界定符等完整 CAN 机制。")
 
 
 if __name__ == "__main__":
