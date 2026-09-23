@@ -24,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
+from .counters import STATE_BUS_OFF, Node
 from .errors import BusFinishedError, ValidationError
 from .framing import (
     EOF,
@@ -122,6 +123,11 @@ class BitBus:
         forced_bits:  位索引 -> 线上被外力强制的电平（0/1），与所有驱动者
                       线与。用于确定性地注入故障（如破坏填充位）；
                       例如在某发送 1 的位置强制 0 -> 该发送者发 1 读 0
+        nodes:        可选，挂接本轮总线的持久 Node（TEC/REC 计数）集合。
+                      每个发送者必须有同名 Node；其余 Node 作为监听者。
+                      传输结果确定时按题面规则结算一次计数（见 counters
+                      模块 docstring）；离线节点禁止作为发送者，列为
+                      监听者时不计数。省略则不跟踪计数（原有行为）。
     """
 
     def __init__(
@@ -130,6 +136,7 @@ class BitBus:
         *,
         ack_pullers: Iterable[str] = (),
         forced_bits: dict[int, int] | None = None,
+        nodes: Iterable[Node] | None = None,
     ) -> None:
         senders = list(senders)
         if not senders:
@@ -169,9 +176,35 @@ class BitBus:
                     )
                 forced[idx] = val
 
+        node_map: dict[str, Node] = {}
+        if nodes is not None:
+            for n in nodes:
+                if not isinstance(n, Node):
+                    raise ValidationError(
+                        f"nodes must be Node instances, got {type(n).__name__}",
+                        "nodes",
+                    )
+                if n.name in node_map:
+                    raise ValidationError(
+                        f"node names must be unique: {n.name!r}", "nodes"
+                    )
+                node_map[n.name] = n
+            for s in senders:
+                if s.name not in node_map:
+                    raise ValidationError(
+                        f"sender {s.name!r} has no matching Node in nodes", "nodes"
+                    )
+                if node_map[s.name].state == STATE_BUS_OFF:
+                    raise ValidationError(
+                        f"sender {s.name!r} is bus-off and may not transmit",
+                        "nodes",
+                    )
+
         self._senders = senders
         self._ack_pullers = pullers
         self._forced = forced
+        self._nodes = node_map
+        self._outcome_applied = False
         self._enc: dict[str, EncodedFrame] = {
             s.name: encode_frame(s.frame) for s in senders
         }
@@ -318,6 +351,7 @@ class BitBus:
                 Event(i, "complete", bus, tuple(self._active_ordered()),
                       "frame completed successfully")
             )
+            self._apply_outcome()
             out_phase = "done"
         else:
             if not losers:
@@ -358,6 +392,36 @@ class BitBus:
         self._phase = "error"
         self._error_to_go = ERROR_FLAG_BITS
         self._pos += 1
+        self._apply_outcome()
+
+    def _apply_outcome(self) -> None:
+        """传输结果确定时把结果折算到各 Node 的 TEC/REC（恰好一次）。
+
+        正常完成：胜者记发送成功，其余节点记接收成功；
+        错误帧中止：被中止的活跃发送者记发送错误，其余节点记接收错误。
+        离线节点不参与总线，不计数。未挂接 nodes 时为空操作。
+        """
+        if self._outcome_applied or not self._nodes:
+            return
+        self._outcome_applied = True
+        if self._error_info is None:
+            winners = set(self._active_ordered())
+            for node in self._nodes.values():
+                if node.state == STATE_BUS_OFF:
+                    continue
+                if node.name in winners:
+                    node._note_transmit_success()
+                else:
+                    node._note_receive_success()
+        else:
+            aborted = set(self._error_info.aborted)
+            for node in self._nodes.values():
+                if node.state == STATE_BUS_OFF:
+                    continue
+                if node.name in aborted:
+                    node._note_transmit_error()
+                else:
+                    node._note_receive_error()
 
     def _step_error_flag(self) -> StepResult:
         i = self._pos

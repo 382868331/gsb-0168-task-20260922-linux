@@ -2,7 +2,9 @@
 
 本库只实现题目定义的有限协议子集：11 位 ID、4 位 DLC(0..8)、
 0..8 字节数据、15 位 CRC（多项式 0x4599，初值 0）、ID..CRC 区段的
-位填充、独立 ACK 槽，以及逐 bit 的总线仲裁/错误帧模型。
+位填充、独立 ACK 槽，逐 bit 的总线仲裁/错误帧模型，以及 TEC/REC
+错误计数（发送错误 +8、接收错误 +1、相应成功 -1；128 被动、
+TEC 256 离线、显式复位清零）。
 
 不宣称兼容完整 CAN 标准。
 """
@@ -39,6 +41,14 @@ from .bus import (
     Sender,
     StepResult,
 )
+from .counters import (
+    BUS_OFF_THRESHOLD,
+    ERROR_PASSIVE_THRESHOLD,
+    RECEIVE_ERROR_PENALTY,
+    SUCCESS_CREDIT,
+    TRANSMIT_ERROR_PENALTY,
+    Node,
+)
 
 __all__ = [
     # 常量
@@ -48,11 +58,17 @@ __all__ = [
     "CRC_MASK",
     "MAX_DATA_LEN",
     "POLYNOMIAL",
+    "ERROR_PASSIVE_THRESHOLD",
+    "BUS_OFF_THRESHOLD",
+    "TRANSMIT_ERROR_PENALTY",
+    "RECEIVE_ERROR_PENALTY",
+    "SUCCESS_CREDIT",
     # 数据结构
     "Frame",
     "EncodedFrame",
     "DestuffResult",
     "Sender",
+    "Node",
     "Event",
     "StepResult",
     "ErrorFrameInfo",

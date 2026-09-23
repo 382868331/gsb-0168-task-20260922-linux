@@ -8,11 +8,13 @@
   2. 同 ID 不同负载 —— 独立编码产物不同（CRC/位流对比）
   3. 填充位被外力破坏 —— 真实定位首个填充位并仿真错误帧中止
   4. CRC 被篡改 + 非法输入边界 —— 解码异常与输入拒绝真实触发
+  5. TEC/REC 错误计数 —— 主动->被动->离线全过程、离线禁发、复位恢复
 """
 
 from canbit import (
     BitBus,
     Frame,
+    Node,
     Sender,
     bit_stuff,
     compute_crc15,
@@ -134,9 +136,60 @@ def main() -> None:
         else:  # pragma: no cover - demo 不应走到这里
             raise AssertionError(f"illegal input was silently accepted: {label}")
 
+    # -----------------------------------------------------------------
+    # 场景 5：TEC/REC 错误计数 —— 主动 -> 被动 -> 离线 -> 复位
+    # -----------------------------------------------------------------
+    hr("场景 5（错误计数）：连续发送错误驱动 TEC 涨满，状态逐级迁移")
+    print("规则：发送错误 TEC+8 / 接收错误 REC+1 / 相应成功 -1（到 0 止）；")
+    print("      任一计数 >=128 被动，TEC >=256 离线；离线禁止发送，reset() 清零。")
+    node_tx = Node("ECU_TX")
+    node_rx = Node("ECU_RX", rec=126)  # 监听者从 126 起步，演示 REC 侧被动阈值
+    print(f"初始: {node_tx} ; {node_rx}")
+    print("每轮发送无人 ACK（ack_error）：发送者 TEC+8，监听者 REC+1")
+
+    prev_tx, prev_rx = node_tx.state, node_rx.state
+    round_no = 0
+    while node_tx.state != "bus_off":
+        BitBus([Sender("ECU_TX", Frame(0x123, b"x"))],
+               nodes=[node_tx, node_rx]).run()
+        round_no += 1
+        changes = []
+        if node_tx.state != prev_tx:
+            changes.append(f"ECU_TX {prev_tx}->{node_tx.state}")
+            prev_tx = node_tx.state
+        if node_rx.state != prev_rx:
+            changes.append(f"ECU_RX {prev_rx}->{node_rx.state}")
+            prev_rx = node_rx.state
+        if changes:
+            print(f"  第 {round_no:>2} 轮后: TEC={node_tx.tec:>3} "
+                  f"REC={node_rx.rec:>3}  " + " ; ".join(changes))
+    print(f"-> 共 {round_no} 轮后 ECU_TX 离线（TEC={node_tx.tec}）")
+
+    try:
+        BitBus([Sender("ECU_TX", Frame(0x123, b"x"))], nodes=[node_tx])
+    except ValidationError as exc:
+        print(f"-> 离线节点再发送被真实拒绝: {type(exc).__name__}: {exc}")
+    else:  # pragma: no cover - demo 不应走到这里
+        raise AssertionError("bus-off node was allowed to transmit")
+
+    node_tx.reset()
+    print(f"-> reset() 后: {node_tx}")
+
+    hr("场景 5b（计数边界）：成功发送/接收把计数减 1（到 0 止）")
+    for _ in range(2):  # 复位后先攒两轮发送错误：TEC=16，监听者 REC 再 +2
+        BitBus([Sender("ECU_TX", Frame(0x123, b"x"))],
+               nodes=[node_tx, node_rx]).run()
+    print(f"两轮 ack_error 后: ECU_TX TEC={node_tx.tec}, ECU_RX REC={node_rx.rec}")
+    ok = BitBus([Sender("ECU_TX", Frame(0x123, b"x"))],
+                ack_pullers={"ECU_RX"}, nodes=[node_tx, node_rx]).run()
+    print(f"一轮被 ACK 的成功传输（completed={ok.completed}）后: "
+          f"ECU_TX TEC={node_tx.tec}（16-1=15）, "
+          f"ECU_RX REC={node_rx.rec}（成功接收 -1）, "
+          f"状态 {node_tx.state}/{node_rx.state}")
+
     hr("演示结束")
     print("所有结果均为运行时真实计算；本模型仅实现本题契约子集，")
-    print("不包含重传、错误界定/被动错误计数等完整 CAN 机制。")
+    print("不包含重传、错误位流叠加、被动错误标志区分等完整 CAN 机制。")
 
 
 if __name__ == "__main__":
