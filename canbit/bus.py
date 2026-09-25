@@ -122,6 +122,10 @@ class BitBus:
         forced_bits:  位索引 -> 线上被外力强制的电平（0/1），与所有驱动者
                       线与。用于确定性地注入故障（如破坏填充位）；
                       例如在某发送 1 的位置强制 0 -> 该发送者发 1 读 0
+        encoded_overrides: 发送者名 -> 预编码的 EncodedFrame，替换内部
+                      encode_frame(sender.frame) 的结果。故障注入钩子
+                      （配合 encode_frame_with_crc 构造线上 CRC 损坏帧），
+                      键必须是本轮发送者名
     """
 
     def __init__(
@@ -130,6 +134,7 @@ class BitBus:
         *,
         ack_pullers: Iterable[str] = (),
         forced_bits: dict[int, int] | None = None,
+        encoded_overrides: dict[str, EncodedFrame] | None = None,
     ) -> None:
         senders = list(senders)
         if not senders:
@@ -169,11 +174,40 @@ class BitBus:
                     )
                 forced[idx] = val
 
+        overrides: dict[str, EncodedFrame] = {}
+        if encoded_overrides is not None:
+            if not isinstance(encoded_overrides, dict):
+                raise ValidationError(
+                    "encoded_overrides must be dict[str, EncodedFrame]",
+                    "encoded_overrides",
+                )
+            for key, enc in encoded_overrides.items():
+                if not isinstance(key, str) or not key:
+                    raise ValidationError(
+                        "encoded_overrides keys must be non-empty sender names",
+                        "encoded_overrides",
+                    )
+                if key not in names:
+                    raise ValidationError(
+                        f"encoded_overrides key {key!r} is not a sender: {names}",
+                        "encoded_overrides",
+                    )
+                if not isinstance(enc, EncodedFrame):
+                    raise ValidationError(
+                        f"encoded_overrides[{key!r}] must be EncodedFrame, "
+                        f"got {type(enc).__name__}",
+                        "encoded_overrides",
+                    )
+                overrides[key] = enc
+
         self._senders = senders
         self._ack_pullers = pullers
         self._forced = forced
         self._enc: dict[str, EncodedFrame] = {
-            s.name: encode_frame(s.frame) for s in senders
+            s.name: (
+                overrides[s.name] if s.name in overrides else encode_frame(s.frame)
+            )
+            for s in senders
         }
 
         self._active: set[str] = set(names)
@@ -221,6 +255,28 @@ class BitBus:
         if sender_name not in self._enc:
             raise ValidationError(f"unknown sender {sender_name!r}", "sender_name")
         return self._enc[sender_name]
+
+    def add_ack_puller(self, name: str) -> None:
+        """传输进行中把某参与者加入 ACK 拉低集合。
+
+        典型用途：节点在 ID 域仲裁失败后转为接收者，应参与本轮 ACK。
+        只能在 ACK 槽之前（transmit 阶段）调用；传输已结束抛
+        BusFinishedError，已过 ACK 槽（ack/eof/error 阶段）抛
+        ValidationError。名字语义与构造参数 ack_pullers 相同。
+        """
+        if self._finished:
+            raise BusFinishedError("transmission already finished")
+        if self._phase != "transmit":
+            raise ValidationError(
+                f"ack pullers can only be added during transmit phase, "
+                f"current phase={self._phase!r}",
+                "name",
+            )
+        if not isinstance(name, str) or not name:
+            raise ValidationError(
+                "ack puller must be a non-empty participant name string", "name"
+            )
+        self._ack_pullers.add(name)
 
     # ---- 逐 bit 推进 -----------------------------------------------------
 
@@ -389,7 +445,12 @@ class BitBus:
         return self.result()
 
     def result(self) -> BusResult:
-        """传输结束后的不可变结果；未结束时调用为契约错误。"""
+        """传输结束后的不可变结果；未结束时调用为契约错误。
+
+        胜者帧 CRC 不匹配（只能由 encoded_overrides 故障注入造成）时
+        不抛异常，以 decoded_crc_ok=False 返回；填充/长度类结构性错误
+        仍抛 FrameDecodeError。
+        """
         if not self._finished:
             raise ValidationError(
                 "result() requires a finished transmission; call run() first"
@@ -401,7 +462,7 @@ class BitBus:
             winners = tuple(self._active_ordered())
             winner_enc = self._enc[winners[0]]
             stuffed = list(self._bus_bits[1 : 1 + len(winner_enc.stuffed)])
-            dec = decode_frame(stuffed)
+            dec = decode_frame(stuffed, raise_on_crc=False)
             decoded = dec.frame
             crc_ok = dec.crc_ok
         return BusResult(

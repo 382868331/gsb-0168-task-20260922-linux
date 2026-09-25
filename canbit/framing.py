@@ -278,8 +278,27 @@ def encode_frame(frame: Frame) -> EncodedFrame:
         raise ValidationError(
             f"frame must be Frame, got {type(frame).__name__}", "frame"
         )
-    raw = payload_bits(frame.identifier, frame.dlc, frame.data)
     crc = compute_crc15(frame.identifier, frame.dlc, frame.data)
+    return _encode_with_crc(frame, crc)
+
+
+def encode_frame_with_crc(frame: Frame, crc: int) -> EncodedFrame:
+    """故障注入用编码：以显式给定的 CRC 值替代真实计算结果。
+
+    用于在总线上构造「填充结构合法但 CRC 校验失败」的帧（接收端
+    decode_frame 报 crc 错误 / crc_ok=False）。除 CRC 字段外与
+    encode_frame 完全一致；不属于正常发送路径，正常发送请用 encode_frame。
+    """
+    if not isinstance(frame, Frame):
+        raise ValidationError(
+            f"frame must be Frame, got {type(frame).__name__}", "frame"
+        )
+    crc = check_int(crc, "crc", 0, CRC_MASK)
+    return _encode_with_crc(frame, crc)
+
+
+def _encode_with_crc(frame: Frame, crc: int) -> EncodedFrame:
+    raw = payload_bits(frame.identifier, frame.dlc, frame.data)
     crc_bits = _bits_of(crc, CRC_BITS)
     stuffed, smap = bit_stuff_mapped([*raw, *crc_bits])
 

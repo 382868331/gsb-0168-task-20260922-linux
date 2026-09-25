@@ -2,7 +2,9 @@
 
 本库只实现题目定义的有限协议子集：11 位 ID、4 位 DLC(0..8)、
 0..8 字节数据、15 位 CRC（多项式 0x4599，初值 0）、ID..CRC 区段的
-位填充、独立 ACK 槽，以及逐 bit 的总线仲裁/错误帧模型。
+位填充、独立 ACK 槽、逐 bit 的总线仲裁/错误帧模型，以及节点级
+固定接收过滤表（(frame_id & mask) == (id & mask)，过滤只决定上交，
+不影响 ACK 与 CRC 校验）。
 
 不宣称兼容完整 CAN 标准。
 """
@@ -29,6 +31,7 @@ from .framing import (
     decode_frame,
     destuff_bits,
     encode_frame,
+    encode_frame_with_crc,
     payload_bits,
 )
 from .bus import (
@@ -38,6 +41,13 @@ from .bus import (
     Event,
     Sender,
     StepResult,
+)
+from .nodes import (
+    BusNode,
+    FilterRule,
+    NodeBus,
+    NodeBusResult,
+    ReceiveRecord,
 )
 
 __all__ = [
@@ -57,15 +67,21 @@ __all__ = [
     "StepResult",
     "ErrorFrameInfo",
     "BusResult",
+    "FilterRule",
+    "BusNode",
+    "ReceiveRecord",
+    "NodeBusResult",
     # 编解码
     "compute_crc15",
     "payload_bits",
     "bit_stuff",
     "destuff_bits",
     "encode_frame",
+    "encode_frame_with_crc",
     "decode_frame",
     # 总线
     "BitBus",
+    "NodeBus",
     # 异常
     "CanError",
     "ValidationError",

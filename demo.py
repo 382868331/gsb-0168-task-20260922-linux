@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 """canbit 固定输入演示：真实计算仲裁胜者与各错误位置（无预录结果）。
 
-运行：python demo.py   （Python 3.14.7，仅标准库，离线）
+运行：./.venv/bin/python demo.py   （Python 3.14.7，仅标准库，离线）
 
-四个场景全部由代码即时计算：
+五个场景全部由代码即时计算：
   1. 两个不同 ID 同时发送 —— 真实仲裁，打印胜者与败者失配位
   2. 同 ID 不同负载 —— 独立编码产物不同（CRC/位流对比）
   3. 填充位被外力破坏 —— 真实定位首个填充位并仿真错误帧中止
   4. CRC 被篡改 + 非法输入边界 —— 解码异常与输入拒绝真实触发
+  5. 接收过滤表 —— 全过滤仍 ACK、重叠规则、CRC 损坏记录、
+     仲裁失败者转接收、只有监听者时 ack_error
 """
 
 from canbit import (
     BitBus,
+    BusNode,
+    FilterRule,
     Frame,
+    NodeBus,
     Sender,
     bit_stuff,
     compute_crc15,
     decode_frame,
     encode_frame,
+    encode_frame_with_crc,
     payload_bits,
 )
 from canbit.errors import FrameDecodeError, ValidationError
@@ -27,6 +33,93 @@ def hr(title: str) -> None:
     print("\n" + "=" * 68)
     print(title)
     print("=" * 68)
+
+
+def demo_filters() -> None:
+    """场景 5：接收过滤表（NodeBus），全部逐 bit 驱动原总线真实计算。"""
+    hr("场景 5（接收过滤表）：过滤只决定上交，不影响 ACK 与 CRC 校验")
+
+    # 5a：全过滤（空表）仍有 ACK ------------------------------------------
+    print("\n[5a] 全过滤（空过滤表）：不上交，但正常接收节点仍 ACK")
+    bus = NodeBus([
+        BusNode("TX", tx_frame=Frame(0x2A5, b"data")),
+        BusNode("RX", filters=()),
+    ])
+    while not bus.finished:
+        bus.step()
+    res = bus.result()
+    (rec,) = res.records_of("RX")
+    print(f"  传输完成={res.bus.completed}，RX 拉低 ACK={res.bus.acked}")
+    print(f"  RX 记录：crc_ok={rec.crc_ok}（过滤不跳过校验），"
+          f"命中规则={rec.matched_rules}，delivered={rec.delivered}")
+
+    # 5b：重叠规则只交付一次，取最早规则序号 ------------------------------
+    print("\n[5b] 两条重叠规则命中同一帧：只交付一次，依据最早规则")
+    rules = (FilterRule(0x100, 0x700), FilterRule(0x180, 0x780))
+    bus = NodeBus([
+        BusNode("TX", tx_frame=Frame(0x1A0, b"\xAA\x55")),
+        BusNode("RX", filters=rules),
+    ])
+    res = bus.run()
+    (rec,) = res.records_of("RX")
+    print(f"  规则表: (id=0x100,mask=0x700), (id=0x180,mask=0x780)；"
+          f"帧 ID=0x1A0 同时命中两条")
+    print(f"  RX 记录：命中规则={rec.matched_rules}，delivered={rec.delivered}，"
+          f"交付依据 rule_index={rec.rule_index}（最早规则）")
+    print(f"  交付次数={len(res.deliveries_of('RX'))}（重叠只交付一次）")
+
+    # 5c：匹配帧 CRC 损坏：记录校验结果但不上交 ---------------------------
+    print("\n[5c] 命中过滤的帧 CRC 损坏：照常 ACK 与记录，不上交")
+    frame = Frame(0x2A5, b"payload!")
+    good_crc = compute_crc15(frame.identifier, frame.dlc, frame.data)
+    bad = encode_frame_with_crc(frame, good_crc ^ 0x0001)
+    print(f"  故障注入：CRC 字段 0x{good_crc:04X} -> 0x{bad.crc:04X}"
+          f"（填充结构保持合法）")
+    bus = NodeBus(
+        [
+            BusNode("TX", tx_frame=frame),
+            BusNode("RX", filters=(FilterRule(0x2A5, 0x7FF),)),
+            BusNode("LIS", filters=(FilterRule(0x2A5, 0x7FF),), listen_only=True),
+        ],
+        encoded_overrides={"TX": bad},
+    )
+    res = bus.run()
+    print(f"  传输完成={res.bus.completed}，ACK={res.bus.acked}")
+    for name in ("RX", "LIS"):
+        (rec,) = res.records_of(name)
+        print(f"  {name} 记录：crc_ok={rec.crc_ok}，命中={rec.matched_rules}，"
+              f"delivered={rec.delivered}")
+
+    # 5d：仲裁失败节点转接收 ----------------------------------------------
+    print("\n[5d] 仲裁失败节点转接收：失败者参与 ACK 并收下胜者帧")
+    bus = NodeBus([
+        BusNode("A", tx_frame=Frame(0x320, b"from-A")),
+        BusNode("B", filters=(FilterRule(0x320, 0x7FF),),
+                tx_frame=Frame(0x321, b"from-B")),
+    ])
+    losers = []
+    while not bus.finished:
+        sr = bus.step()
+        losers.extend(sr.arbitration_losers)
+    res = bus.result()
+    (rec_b,) = res.records_of("B")
+    print(f"  仲裁失败者={losers}，胜者={res.bus.winners}，"
+          f"ACK={res.bus.acked}（总线仅 A/B，证明 B 失败后转为接收者拉低 ACK）")
+    print(f"  B 记录：ID=0x{rec_b.frame.identifier:03X} "
+          f"data={rec_b.frame.data!r}，delivered={rec_b.delivered}，"
+          f"rule_index={rec_b.rule_index}")
+
+    # 5e：只有监听者 -> ack_error ------------------------------------------
+    print("\n[5e] 只有监听者：永不 ACK -> 发送者报 ack_error")
+    bus = NodeBus([
+        BusNode("TX", tx_frame=Frame(0x123, b"q")),
+        BusNode("L1", filters=(FilterRule(0x123, 0x7FF),), listen_only=True),
+    ])
+    res = bus.run()
+    ef = res.bus.error_frame
+    print(f"  触发 {ef.trigger}，检测位={ef.bit_index}，参与者={ef.participants}")
+    print(f"  传输完成={res.bus.completed}，接收记录数={len(res.records)}"
+          f"（帧未完成，无记录）")
 
 
 def main() -> None:
@@ -126,6 +219,9 @@ def main() -> None:
         ("bool 冒充 int", lambda: Frame(True, b"")),
         ("数据超 8 字节", lambda: Frame(0, b"x" * 9)),
         ("NaN", lambda: compute_crc15(float("nan"), 0, b"")),
+        ("过滤 mask 超 11 位", lambda: FilterRule(0x123, 0x800)),
+        ("监听节点携带发送帧", lambda: BusNode("N", listen_only=True,
+                                               tx_frame=Frame(0))),
     ]:
         try:
             make()
@@ -133,6 +229,8 @@ def main() -> None:
             print(f"  拒绝 [{label}] -> {type(exc).__name__}: {exc}")
         else:  # pragma: no cover - demo 不应走到这里
             raise AssertionError(f"illegal input was silently accepted: {label}")
+
+    demo_filters()
 
     hr("演示结束")
     print("所有结果均为运行时真实计算；本模型仅实现本题契约子集，")

@@ -152,6 +152,17 @@ def ref_stuff_positions(bits: list[int]) -> set[int]:
     return {i for i, (_, is_stuff) in enumerate(out) if is_stuff}
 
 
+def ref_filter_match(frame_id: int, identifier: int, mask: int) -> bool:
+    """独立过滤匹配参考：把三者展开成 11 位列表，逐位比较 mask 覆盖位。
+
+    与被测核心 FilterRule.matches 的整数掩码运算结构不同，用于对拍。
+    """
+    fid = ref_int_to_bits(frame_id, 11)
+    iid = ref_int_to_bits(identifier, 11)
+    msk = ref_int_to_bits(mask, 11)
+    return all(f == i for f, i, m in zip(fid, iid, msk) if m == 1)
+
+
 def ref_simulate_bus(
     frames: list[tuple[str, int, bytes]],
     *,
