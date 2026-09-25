@@ -12,7 +12,9 @@
 
 from canbit import (
     BitBus,
+    Filter,
     Frame,
+    Node,
     Sender,
     bit_stuff,
     compute_crc15,
@@ -133,6 +135,77 @@ def main() -> None:
             print(f"  拒绝 [{label}] -> {type(exc).__name__}: {exc}")
         else:  # pragma: no cover - demo 不应走到这里
             raise AssertionError(f"illegal input was silently accepted: {label}")
+
+    # -----------------------------------------------------------------
+    # 场景 5（新功能）：固定接收过滤表 —— 被过滤的正确帧仍有 ACK
+    # -----------------------------------------------------------------
+    hr("场景 5（接收过滤）：全过滤仍有 ACK，上交附最早命中规则序号")
+    f5 = Frame(0x1A2, b"rx")
+    nodes5 = [
+        Node("GATEWAY", [Filter(0x180, 0x7C0), Filter(0x1A2, 0x7FF)]),  # 两条都命中
+        Node("SENSOR", [Filter(0x7FF, 0x7FF)]),   # 只收 0x7FF -> 不命中
+        Node("EMPTY", []),                        # 空表 -> 不命中
+    ]
+    print("发送帧 ID=0x1A2 data=b'rx'。规则命中 (id&mask)==(want&mask)：")
+    print("  GATEWAY 规则0 (0x180,0x7C0) 与规则1 (0x1A2,0x7FF) 同时命中")
+    print("  SENSOR 仅精确收 0x7FF；EMPTY 过滤表为空")
+    bus5 = BitBus([Sender("ECU_A", f5)], nodes=nodes5)
+    r5 = bus5.run()
+    print(f"传输完成={r5.completed}，ACK={r5.acked}（被过滤节点也照常 CRC 校验并 ACK）")
+    for name, rec in r5.receptions.items():
+        tag = f"上交 规则#{rec.rule_index}" if rec.delivered else "不上交"
+        print(f"  {name:8s}: CRC正确={rec.crc_ok!s:5s} ACK={rec.acked!s:5s} -> {tag}")
+    delivered = r5.delivered()
+    print(f"实际上交节点数={len(delivered)}（GATEWAY 即使双命中也只交付一次，序号取最早 0）")
+
+    # -----------------------------------------------------------------
+    # 场景 6（新功能）：只有监听者 -> ack_error；监听者记录校验结果
+    # -----------------------------------------------------------------
+    hr("场景 6（监听模式）：总线上只有监听者 -> 发送者 ack_error")
+    f6 = Frame(0x1A2, b"rx")
+    lis = Node("SNIFFER", [Filter(0x1A2, 0x7FF)], listen_only=True)
+    r6 = BitBus([Sender("ECU_A", f6)], nodes=[lis]).run()
+    rec = r6.receptions["SNIFFER"]
+    print(f"发送帧 ID=0x1A2；SNIFFER 为监听模式。结果：completed={r6.completed}")
+    print(f"-> 触发 {r6.error_frame.trigger} @bit {r6.error_frame.bit_index}，"
+          f"检测者={r6.error_frame.participants}（监听者不在其中）")
+    print(f"-> SNIFFER: CRC正确={rec.crc_ok} 按过滤表记录={rec.delivered} "
+          f"但 ACK={rec.acked}（永不 ACK、永不发错误标志）")
+
+    # -----------------------------------------------------------------
+    # 场景 7（新功能）：匹配帧 CRC 损坏 + 仲裁失败转接收
+    # -----------------------------------------------------------------
+    hr("场景 7（CRC 损坏 / 仲裁失败转接收）")
+    f7 = Frame(0x201, b"payload!")
+    enc7 = encode_frame(f7)
+    # 选一个发隐性 1 的数据/CRC 位，仅在接收视角线与成 0（总线本身不坏）
+    bad_bit = next(
+        off for off, b in enumerate(enc7.stream)
+        if 15 < off < enc7.ack_index and b == 1
+    )
+    good_rx = Node("RX_OK", [Filter(0x200, 0x700)])
+    print(f"帧 ID=0x201；仅接收视角在 bit#{bad_bit} 被干扰 1->0（发送者无错）")
+    r7 = BitBus(
+        [Sender("ECU_A", f7)],
+        nodes=[good_rx],
+        ack_pullers={"BARE_ACK"},          # 另有裸 ACK 者保证传输完成
+        receive_glitches={bad_bit: 0},
+    ).run()
+    rr = r7.receptions["RX_OK"]
+    print(f"总线层面 completed={r7.completed}（无 bit_error）；"
+          f"RX_OK 看到 CRC正确={rr.crc_ok} 上交={rr.delivered}")
+
+    print()
+    print("仲裁失败转接收：ECU_A(ID=0x321) vs ECU_B(ID=0x320) 同时发送")
+    node_a = Node("ECU_A", [Filter(0x300, 0x700)])
+    r7b = BitBus(
+        [Sender("ECU_A", Frame(0x321, b"hi")), Sender("ECU_B", Frame(0x320, b"yo"))],
+        nodes=[node_a],
+    ).run()
+    ra = r7b.receptions["ECU_A"]
+    print(f"胜者={r7b.winners[0]}；ECU_A 失配后转接收，收到 "
+          f"ID=0x{ra.frame.identifier:03X} data={ra.frame.data!r} "
+          f"CRC正确={ra.crc_ok} 上交={ra.delivered}（规则#0）ACK={ra.acked}")
 
     hr("演示结束")
     print("所有结果均为运行时真实计算；本模型仅实现本题契约子集，")

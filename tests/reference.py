@@ -256,3 +256,206 @@ def ref_simulate_bus(
                 "bus": bus,
             }
         pos += 1
+
+
+# ---- 接收节点 / 固定过滤表的独立参考 ------------------------------------
+#
+# 不 import canbit：节点逐位缓冲、去填充、CRC 复核、过滤命中与 ACK
+# 决策全部在本模块独立复算，期望值不来自被测代码。
+
+
+def ref_filter_match(rules, frame_id):
+    """rules: [(id, mask), ...]；返回最早命中序号，否则 None。"""
+    for index, (rid, mask) in enumerate(rules):
+        if (frame_id & mask) == (rid & mask):
+            return index
+    return None
+
+
+def ref_decode_reception(stuffed):
+    """独立“接收视角”解码：去填充 -> 切字段 -> 复核 CRC。
+
+    CRC 损坏（结构完好）不抛，给 crc_ok=False；结构无法切分给 error。
+    """
+    raw, stuff_err = ref_destuff(stuffed)
+    if stuff_err is not None:
+        return {"ok": False, "stuff_ok": False, "error": "stuff",
+                "frame": None, "crc_ok": False}
+    if len(raw) < 15:
+        return {"ok": False, "stuff_ok": True, "error": "length",
+                "frame": None, "crc_ok": False}
+    ident = ref_bits_to_int(raw[:11])
+    dlc = ref_bits_to_int(raw[11:15])
+    if dlc > 8:
+        return {"ok": False, "stuff_ok": True, "error": "protocol",
+                "frame": None, "crc_ok": False}
+    expected = 11 + 4 + 8 * dlc + 15
+    if len(raw) != expected:
+        return {"ok": False, "stuff_ok": True, "error": "length",
+                "frame": None, "crc_ok": False}
+    data_bits = raw[15 : 15 + 8 * dlc]
+    data = bytes(
+        ref_bits_to_int(data_bits[i : i + 8]) for i in range(0, len(data_bits), 8)
+    )
+    crc_ok = ref_bits_to_int(raw[-15:]) == ref_crc15(ident, dlc, data)
+    return {"ok": crc_ok, "stuff_ok": True, "error": None,
+            "frame": (ident, dlc, data), "crc_ok": crc_ok}
+
+
+def ref_node_records(specs, rx_active, rxbits, rxack):
+    """根据当前接收缓冲独立生成每个在收节点的接收记录。"""
+    records = {}
+    for n in rx_active:
+        rules, listen = specs[n]
+        dec = ref_decode_reception(rxbits[n])
+        rule = (
+            ref_filter_match(rules, dec["frame"][0])
+            if dec["frame"] is not None
+            else None
+        )
+        delivered = dec["ok"] and rule is not None
+        records[n] = {
+            "frame": dec["frame"],
+            "delivered": delivered,
+            "rule_index": rule if delivered else None,
+            "crc_ok": dec["crc_ok"],
+            "stuff_ok": dec["stuff_ok"],
+            "acked": rxack.get(n, False),
+            "listen_only": listen,
+            "error": dec["error"],
+        }
+    return records
+
+
+def ref_simulate_bus_nodes(
+    frames,
+    nodes,
+    *,
+    ack_pullers=None,
+    forced_bits=None,
+    receive_glitches=None,
+):
+    """带接收节点/固定过滤表的一次性独立全量仿真。
+
+    frames: [(name, identifier, data), ...]
+    nodes:  [(name, [(filter_id, mask), ...], listen_only), ...]
+    仲裁失败者若有同名节点，则自失配位起转接收（回填此前总线位）。
+    """
+    ack_pullers = set(ack_pullers or ())
+    forced_bits = forced_bits or {}
+    receive_glitches = receive_glitches or {}
+    enc = {
+        name: ref_encode_stream(ident, len(data), data)
+        for name, ident, data in frames
+    }
+    specs = {name: (list(rules), bool(listen)) for name, rules, listen in nodes}
+    listener_names = {n for n, (_, listen) in specs.items() if listen}
+
+    active = [name for name, _, _ in frames]
+    rx_active = {n for n in specs if n not in active}
+    rxbits = {n: [] for n in rx_active}
+    rxack = {n: False for n in rx_active}
+    losers = []
+    wire = {}  # 位置 -> 实际总线电平（仲裁失败前各发送者位流必然相同）
+
+    def sample(name, pos, bus_bit):
+        bit = bus_bit & receive_glitches[pos] if pos in receive_glitches else bus_bit
+        rxbits[name].append(bit)
+
+    pos = 0
+    outcome = "complete"
+    records = {}
+    while True:
+        slot = "data"
+        contrib = {}
+        for name in active:
+            e = enc[name]
+            if pos == e["ack_index"]:
+                slot, contrib[name] = "ack", 1
+            elif pos == e["eof_index"]:
+                slot, contrib[name] = "eof", 1
+            else:
+                contrib[name] = e["stream"][pos]
+
+        bus = 0 if any(v == 0 for v in contrib.values()) else 1
+
+        node_pullers = set()
+        if slot == "ack":
+            for name in rx_active:
+                _, listen = specs[name]
+                if not listen and ref_decode_reception(rxbits[name])["ok"]:
+                    node_pullers.add(name)
+            effective = (ack_pullers - listener_names) | node_pullers
+        else:
+            effective = ack_pullers
+        if slot == "ack" and effective:
+            bus = 0
+        if pos in forced_bits:
+            bus &= forced_bits[pos]
+        if slot == "data":
+            wire[pos] = bus
+
+        if slot == "data":
+            id_sets = {
+                name: ref_id_indices(
+                    len(enc[name]["stuffed"]),
+                    ref_stuff_positions(enc[name]["raw"] + enc[name]["crc_bits"]),
+                )
+                for name in active
+            }
+            new_losers, err_nodes = [], []
+            for name, bit in contrib.items():
+                if bit == bus:
+                    continue
+                if bit == 1 and bus == 0 and pos in id_sets[name]:
+                    new_losers.append(name)
+                else:
+                    err_nodes.append(name)
+            if err_nodes:
+                for n in rx_active:
+                    sample(n, pos, bus)
+                outcome = "bit_error"
+                break
+            for name in new_losers:
+                active.remove(name)
+                losers.append((name, pos))
+                if name in specs and name not in rx_active:
+                    rx_active.add(name)
+                    rxbits[name] = [
+                        (wire[k] & receive_glitches[k])
+                        if k in receive_glitches else wire[k]
+                        for k in range(1, pos)
+                    ]
+                    rxack[name] = False
+
+        if slot == "eof" and any(bit != bus for bit in contrib.values()):
+            outcome = "bit_error"
+            break
+
+        if slot == "data" and pos != 0:
+            for n in list(rx_active):
+                sample(n, pos, bus)
+
+        if slot == "ack":
+            for n in rx_active:
+                rxack[n] = bus == 0 and n in effective
+            records = ref_node_records(specs, rx_active, rxbits, rxack)
+            if bus == 1:
+                outcome = "ack_error"
+                break
+
+        if slot == "eof":
+            break
+        pos += 1
+
+    if outcome == "bit_error":
+        records = ref_node_records(specs, rx_active, rxbits, rxack)
+    # complete / ack_error：记录在 ACK 槽已生成
+
+    return {
+        "outcome": outcome,
+        "winner": tuple(active) if outcome == "complete" else (),
+        "losers": tuple(losers),
+        "records": records,
+        "acked": outcome == "complete",
+    }

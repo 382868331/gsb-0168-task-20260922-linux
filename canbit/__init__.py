@@ -39,6 +39,16 @@ from .bus import (
     Sender,
     StepResult,
 )
+from .node import (
+    FILTER_ID_BITS,
+    FILTER_MASK_MAX,
+    FILTER_MAX_RULES,
+    Filter,
+    Node,
+    ReceiveRecord,
+    evaluate_reception,
+    first_match,
+)
 
 __all__ = [
     # 常量
@@ -57,6 +67,15 @@ __all__ = [
     "StepResult",
     "ErrorFrameInfo",
     "BusResult",
+    # 接收节点 / 固定过滤表
+    "Filter",
+    "Node",
+    "ReceiveRecord",
+    "evaluate_reception",
+    "first_match",
+    "FILTER_ID_BITS",
+    "FILTER_MASK_MAX",
+    "FILTER_MAX_RULES",
     # 编解码
     "compute_crc15",
     "payload_bits",
