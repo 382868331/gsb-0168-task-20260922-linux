@@ -31,6 +31,17 @@ from .framing import (
     encode_frame,
     payload_bits,
 )
+from .timing import (
+    MAX_SAMPLES,
+    BitTiming,
+    Edge,
+    Glitch,
+    PhaseCorrection,
+    ReceptionResult,
+    SampleRecord,
+    receive_edges,
+    simulate_edges,
+)
 from .bus import (
     BitBus,
     BusResult,
@@ -66,6 +77,16 @@ __all__ = [
     "decode_frame",
     # 总线
     "BitBus",
+    # 边沿定时接收
+    "BitTiming",
+    "Edge",
+    "Glitch",
+    "SampleRecord",
+    "PhaseCorrection",
+    "ReceptionResult",
+    "receive_edges",
+    "simulate_edges",
+    "MAX_SAMPLES",
     # 异常
     "CanError",
     "ValidationError",

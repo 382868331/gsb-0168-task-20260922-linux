@@ -1,7 +1,10 @@
 # canbit — CAN 合成位流的仲裁与错误约束（本题契约子集）
 
 一个零依赖的离线 Python 题库，对**有限定义**的 CAN 风格总线做逐 bit 建模：
-帧编码、CRC15、位填充、wired-AND 仲裁、位错误、显式 ACK 槽与错误帧中止。
+帧编码、CRC15、位填充、wired-AND 仲裁、位错误、显式 ACK 槽与错误帧中止；
+另提供**边沿时间输入入口**：按位定时参数（传播段/相位段/SJW）计算采样点，
+在隐性到显性边沿做帧起始硬同步与帧内有界重同步，恢复位流后交给同一套
+去填充与帧检查。
 
 > **本库只实现题面契约定义的有限协议子集，不宣称兼容完整 CAN 标准**
 > （无 RTR/IDE/控制场其余位、无重传、无错误界定/被动错误计数、无位时序
@@ -17,14 +20,19 @@
 ## 准确命令
 
 ```bash
-# 必要测试（37 个用例，实测 < 0.1s）
+# 必要测试（55 个用例，实测 < 0.1s）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（实测约 0.04s，远小于 8s 预算；无 sleep、无预录结果）
+# 固定输入演示（实测约 0.04s；无 sleep、无预录结果）
 python demo.py
+
+# 边沿定时接收入口演示（实测约 0.04s，远小于 90s 预算；真实计算正常
+# 与边界结果，无 sleep、无预录输出）
+python demo_iteration.py
 ```
 
-在仓库根目录执行；`python` 指向 3.14.7 解释器即可。
+在仓库根目录执行；`python` 指向 3.14.7 解释器即可。如需隔离环境：
+`python -m venv .venv && . .venv/bin/activate`（无第三方依赖，venv 可选）。
 
 ## 协议契约（本题）
 
@@ -64,6 +72,53 @@ from canbit.errors import (
     CanError, ValidationError, FrameDecodeError, BusFinishedError,
 )
 ```
+
+边沿时间输入入口（本轮新增，与逐 bit 入口并存）：
+
+```python
+from canbit import (
+    BitTiming,            # BitTiming(prop_seg, phase_seg1, phase_seg2, sjw)
+    Edge, Glitch,         # 边沿 / 毛刺（均为整数 tq 参数）
+    SampleRecord, PhaseCorrection, ReceptionResult,
+    receive_edges,        # (edges, timing) -> ReceptionResult
+    simulate_edges,       # (bits, timing, drift_num=, drift_den=, glitches=) -> [Edge]
+    MAX_SAMPLES,
+)
+
+timing = BitTiming(prop_seg=3, phase_seg1=3, phase_seg2=3, sjw=2)
+timing.tq_per_bit      # 10（同步段 1 + 3 + 3 + 3）
+timing.sample_point    # 7（采样点相对位起始的 tq 偏移）
+
+# 发送侧（测试/演示用）：理想位流 + 确定性时钟偏差 + 短毛刺 -> 边沿序列
+edges = simulate_edges(enc.stream, timing, drift_num=1, drift_den=8,
+                       glitches=[(22, 0, 2)])
+
+# 接收侧：只给边沿时间与位定时参数，不预先知道原始位串
+res = receive_edges(edges, timing)
+res.status          # "ok" | "crc_error" | "stuff_error" | "length_error"
+                    # | "protocol_error" | "no_frame" | "incomplete"
+res.samples         # 每次采样 SampleRecord(bit_index, time, bit)
+res.corrections     # 每次相位调整 PhaseCorrection(kind/edge_time/phase_error/
+                    # applied/clamped)；kind="hard_sync"（帧起始）与
+                    # "resync"（帧内，|applied|<=sjw）分开记录
+res.bits            # 恢复出的位流（SOF 起，含 ACK/EOF）
+res.frame, res.crc_ok, res.error_bit_index
+```
+
+边沿接收契约：
+
+* 每位 = 1（同步段）+ prop_seg + phase_seg1 + phase_seg2 个整数 tq；
+  采样点由参数计算，接收方不预先知道原始位串。
+* 空闲时首个隐性到显性边沿做**硬同步**（SOF 起点，SOF 采样必须为显性）；
+  帧内只在隐性到显性边沿做**有界**相位调整：采样点之前出现的边沿视为
+  上一位边界来晚（本位加长），之后出现的视为下一位边界来早（本位缩短），
+  调整幅度截断到 ±sjw 并记录 clamped。
+* 恢复位流按 SOF + 填充流 + ACK + EOF 切分，填充流交给既有
+  `decode_frame` 去填充并校验 CRC；终止于帧尾成功解码、填充规则违例、
+  6 连续显性采样、或无后续边沿后的持续隐性（损坏帧）。
+* `simulate_edges` 的时钟偏差是有理数：每 drift_den 位累计 drift_num
+  个 tq（整数累加器摊派，可正可负）；毛刺为 (time, level, duration)。
+* 全模块纯整数运算，无浮点。
 
 逐 bit 用法：
 
@@ -131,7 +186,10 @@ NaN/Infinity）一律拒绝，不参与任何数值运算。测试中不存在�
 ## 已知限制
 
 * 不是完整 CAN/CAN FD：无 RTR、IDE、保留位、控制场其余编码、远程帧、
-  过载帧、帧间隙、位时序/同步、重同步跳转宽度。
+  过载帧、帧间隙。
+* 边沿定时接收是明确定义的合成模型，不宣称完整控制器兼容：无振荡器
+  容差/抖动模型、无多次采样多数判决、无错误界定符与错误计数、无
+  发送延迟补偿；硬同步只发生在空闲后的首个隐性到显性边沿。
 * 无重传、无主动/被动错误/总线关闭状态机、无错误界定符与错误计数。
 * ACK 槽为 1 位模型，不区分 ACK 槽/界定符；EOF 为 1 位而非 7 位。
 * `forced_bits` 是测试/演示用的确定性故障注入钩子，不代表真实收发器行为。
@@ -145,8 +203,11 @@ canbit/__init__.py     # 公开导出
 canbit/errors.py       # CanError/ValidationError/FrameDecodeError/BusFinishedError
 canbit/framing.py      # Frame/CRC15/位填充/整帧编码与解码
 canbit/bus.py          # BitBus：逐 bit 仲裁/位错误/ACK/错误帧
+canbit/timing.py       # 边沿时间输入：位定时/硬同步/有界重同步/发送方仿真
 tests/test_framing.py  # CRC、填充、编解码测试（对照独立参考）
 tests/test_bus.py      # 仲裁/错误/ACK/契约/差分对拍测试
+tests/test_timing.py   # 边沿接收：理想/可修复偏差/超界偏差/毛刺/校验
 tests/reference.py     # 独立参考实现（不 import canbit）
-demo.py                # 固定输入演示
+demo.py                # 固定输入演示（逐 bit 总线模型）
+demo_iteration.py      # 边沿定时接收演示（正常 + 边界结果）
 ```
