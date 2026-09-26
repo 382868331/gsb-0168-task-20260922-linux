@@ -39,6 +39,15 @@ from .bus import (
     Sender,
     StepResult,
 )
+from .timing import (
+    BitTiming,
+    Edge,
+    Glitch,
+    ReceiveReport,
+    SampleRecord,
+    receive_edges,
+    synthesize_edges,
+)
 
 __all__ = [
     # 常量
@@ -66,6 +75,14 @@ __all__ = [
     "decode_frame",
     # 总线
     "BitBus",
+    # 位定时 / 边沿输入
+    "BitTiming",
+    "Edge",
+    "Glitch",
+    "SampleRecord",
+    "ReceiveReport",
+    "synthesize_edges",
+    "receive_edges",
     # 异常
     "CanError",
     "ValidationError",

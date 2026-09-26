@@ -1,11 +1,15 @@
-# canbit — CAN 合成位流的仲裁与错误约束（本题契约子集）
+# canbit — CAN 合成位流的仲裁、错误约束与边沿定时接收（本题契约子集）
 
 一个零依赖的离线 Python 题库，对**有限定义**的 CAN 风格总线做逐 bit 建模：
-帧编码、CRC15、位填充、wired-AND 仲裁、位错误、显式 ACK 槽与错误帧中止。
+帧编码、CRC15、位填充、wired-AND 仲裁、位错误、显式 ACK 槽与错误帧中止；
+本轮新增**边沿时间输入入口**：位定时参数（传播段/相位段/重同步幅度）、
+确定性发送时钟偏差与短毛刺合成、帧起始硬同步与帧内有界重同步、
+采样恢复后接既有去填充与帧检查。
 
 > **本库只实现题面契约定义的有限协议子集，不宣称兼容完整 CAN 标准**
 > （无 RTR/IDE/控制场其余位、无重传、无错误界定/被动错误计数、无位时序
-> 与同步、无错误界定符/帧间隙等）。
+> 与真实收发器、无错误界定符/帧间隙等）。边沿定时同样是明确定义的
+> 合成模型，不宣称完整控制器兼容。
 
 ## 运行环境
 
@@ -14,14 +18,26 @@
   数据库/中间件/云 API/Docker
 * 核心、测试、demo 全部离线、确定性
 
+## venv 准备（可选）
+
+不强制：任何指向 3.14.7 的 `python` 都可以直接跑。如需隔离环境：
+
+```bash
+python3.14 -m venv .venv
+source .venv/bin/activate   # 之后 python 即 3.14.7
+```
+
 ## 准确命令
 
 ```bash
-# 必要测试（37 个用例，实测 < 0.1s）
+# 必要测试（51 个用例，实测 < 0.1s）
 python -m unittest discover -s tests -v
 
 # 固定输入演示（实测约 0.04s，远小于 8s 预算；无 sleep、无预录结果）
 python demo.py
+
+# 本轮新增：边沿定时演示（正常 + 边界，实测约 0.06s，远小于 90s 预算）
+python demo_iteration.py
 ```
 
 在仓库根目录执行；`python` 指向 3.14.7 解释器即可。
@@ -59,10 +75,57 @@ from canbit import (
     encode_frame, decode_frame,
     # 常量
     ID_BITS, DLC_BITS, CRC_BITS, MAX_DATA_LEN, POLYNOMIAL,
+    # 边沿时间输入入口（本轮新增）
+    BitTiming,            # BitTiming(prop_seg, phase_seg1, phase_seg2, sjw)
+    Edge, Glitch,         # 边沿 / 确定性短毛刺
+    SampleRecord, ReceiveReport,
+    synthesize_edges,     # (bits, timing, *, skew_ppm=0, glitches=()) -> list[Edge]
+    receive_edges,        # (edges, timing, *, glitch_filter_tq=1, max_bits=200) -> ReceiveReport
 )
 from canbit.errors import (
     CanError, ValidationError, FrameDecodeError, BusFinishedError,
 )
+```
+
+## 边沿时间输入入口（本轮新增）
+
+旧的直接位流入口（`decode_frame` 等）继续保留；新入口的输入是**边沿
+时间表**而不是 0/1 位串，接收端不预先知道原始位串，采样点完全由位定时
+参数算出。
+
+* **位定时**：`BitTiming(prop_seg, phase_seg1, phase_seg2, sjw)`，单位都是
+  整数时间量子 tq。派生量：`tq_per_bit = 1 + prop_seg + phase_seg1 +
+  phase_seg2`，`sample_point = 1 + prop_seg + phase_seg1`（位内 tq 偏移）。
+  `sjw` 为重同步单次调整上限，要求 `1 <= sjw <= phase_seg2`。
+* **边沿合成**：`synthesize_edges(bits, timing, *, skew_ppm=0, glitches=())`
+  用确定性发送时钟把理想位串变成边沿表：发送位宽 =
+  `tq_per_bit * (1 + skew_ppm/1e6)`（`skew_ppm` 为整数百万分比，
+  ±500000 以内）；`Glitch(bit_index, offset_tq, width_tq)` 在隐性位内注入
+  短显性脉冲。所有时刻为 `fractions.Fraction`，无浮点、无随机源。
+* **接收**：`receive_edges(edges, timing, *, glitch_filter_tq=1, max_bits=200)`
+    - 帧起始**硬同步**：第一个隐性->显性边沿定位 SOF 起点；
+    - 帧内**重同步**：只认隐性->显性边沿；边沿提前则缩短当前位、滞后则
+      延长当前位，单次幅度以 `sjw` 为界；落在下一位采样点之后的边沿属于
+      更晚的位边界，不消费；
+    - 宽度 `<= glitch_filter_tq` 的显性脉冲判为毛刺，不参与同步（但仍
+      影响电平采样）；
+    - 恢复位流增量去填充，凑齐 ID+DLC+数据+CRC 后交给既有
+      `decode_frame` 做帧检查。
+* **报告**：`ReceiveReport` 含每次采样的 `SampleRecord`（采样时刻、
+  采样值、sync 标记 `"hard"/"resync"/""`、带符号相位修正量）、恢复位流、
+  最终状态 `status`（`ok | no_frame | stuff_error | crc_error |
+  protocol_error | length_error | incomplete`）与解码结果。
+
+```python
+timing = BitTiming(prop_seg=3, phase_seg1=4, phase_seg2=4, sjw=2)
+stream = encode_frame(Frame(0x321, b"hi")).stream      # 发送侧理想位串
+edges = synthesize_edges(stream, timing, skew_ppm=20_000,
+                         glitches=[Glitch(5, 2, 1)])   # 快 2% + 毛刺
+rep = receive_edges(edges, timing)
+rep.status                 # "ok"
+rep.samples[0].sync        # "hard"（帧起始硬同步，与帧内 resync 分开）
+rep.total_correction       # 全部相位修正的代数和（Fraction，单位 tq）
+rep.decoded.frame          # Frame(identifier=0x321, data=b'hi')
 ```
 
 逐 bit 用法：
@@ -131,7 +194,10 @@ NaN/Infinity）一律拒绝，不参与任何数值运算。测试中不存在�
 ## 已知限制
 
 * 不是完整 CAN/CAN FD：无 RTR、IDE、保留位、控制场其余编码、远程帧、
-  过载帧、帧间隙、位时序/同步、重同步跳转宽度。
+  过载帧、帧间隙；位时序仅有下述合成模型，非真实控制器实现。
+* 边沿定时入口是合成模型：单发送者、无仲裁并发、无真实收发器延迟；
+  重同步只认隐性->显性边沿且单次以 sjw 为界，不实现完整控制器的
+  位时序状态机；毛刺模型仅限隐性位内的短显性脉冲。
 * 无重传、无主动/被动错误/总线关闭状态机、无错误界定符与错误计数。
 * ACK 槽为 1 位模型，不区分 ACK 槽/界定符；EOF 为 1 位而非 7 位。
 * `forced_bits` 是测试/演示用的确定性故障注入钩子，不代表真实收发器行为。
@@ -145,8 +211,11 @@ canbit/__init__.py     # 公开导出
 canbit/errors.py       # CanError/ValidationError/FrameDecodeError/BusFinishedError
 canbit/framing.py      # Frame/CRC15/位填充/整帧编码与解码
 canbit/bus.py          # BitBus：逐 bit 仲裁/位错误/ACK/错误帧
+canbit/timing.py       # BitTiming/边沿合成/有界重同步接收（本轮新增）
 tests/test_framing.py  # CRC、填充、编解码测试（对照独立参考）
 tests/test_bus.py      # 仲裁/错误/ACK/契约/差分对拍测试
+tests/test_timing.py   # 边沿定时：零偏差逐位对照、可修复/超限偏差、毛刺
 tests/reference.py     # 独立参考实现（不 import canbit）
 demo.py                # 固定输入演示
+demo_iteration.py      # 本轮演示：可修复偏差+毛刺（正常）与超限偏差（边界）
 ```
