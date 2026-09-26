@@ -17,14 +17,24 @@
 ## 准确命令
 
 ```bash
-# 必要测试（37 个用例，实测 < 0.1s）
+# 必要测试（53 个用例，实测 < 0.1s）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（实测约 0.04s，远小于 8s 预算；无 sleep、无预录结果）
+# 位流层演示（实测约 0.04s；无 sleep、无预录结果）
 python demo.py
+
+# 传输层演示：正常 + 4 个边界，真实计算（实测约 0.05s，远小于 90s 预算）
+python demo_iteration.py
 ```
 
 在仓库根目录执行；`python` 指向 3.14.7 解释器即可。
+
+venv 准备（可选，库只用标准库，venv 内无需安装任何依赖）：
+
+```bash
+python3.14 -m venv .venv
+.venv/bin/python -m unittest discover -s tests -v
+```
 
 ## 协议契约（本题）
 
@@ -91,6 +101,56 @@ dec = decode_frame(stuffed, raise_on_crc=False)     # CRC 错不抛，返回 crc
 # FrameDecodeError.bit_index：填充后流的 0 基索引（可定位）
 ```
 
+## 传输层（本轮新增，本题自定义小子集）
+
+在 `Frame` 之上提供显式分段传输：首帧声明总字节数，连续帧带模 16 序号，
+接收端用流控帧给出块大小与最小发送间隔。**不宣称覆盖 ISO-TP 等车规标准。**
+
+### 帧格式（承载于 Frame.data，DLC ≤ 8，第 1 字节为 PCI）
+
+| 帧 | PCI | 格式 |
+|---|---|---|
+| 首帧 FF | 0x1 | `0x10|(total>>8), total&0xFF, 前 6 数据字节`；total ∈ 1..4095（12 位） |
+| 连续帧 CF | 0x2 | `0x20|(seq&0x0F), 至多 7 数据字节`；seq 从 1 起模 16 递增 |
+| 流控帧 FC | 0x3 | `0x30|fs, block_size, st_min`；fs：0=CTS / 1=WAIT / 2=OVFLW |
+
+`block_size`：收到该数量 CF 后接收端回发新 FC（0 = 不限）；
+`st_min`：相邻 CF 的最小发送间隔，单位为逻辑时钟 tick（本层不读真实
+时钟，时间完全由调用方以整数 tick 驱动，无 sleep）。
+
+### 语义
+
+* 接收端只在全部字节到齐时一次性交付；任何失败整次作废，绝不交付部分消息。
+* 序号跳跃（含丢帧）、超长首帧（total > max_message）、会话内格式变化
+  （接收中途来新首帧 / 空闲时收到 CF、FC）均使整次接收失败并清空缓存；
+  新首帧不会无声覆盖正在接收的数据。
+* 流控 WAIT 最多连续接受 `max_waits` 次（默认 3），超过发送方中止。
+* 逻辑时钟超过 `timeout` tick 没有下一帧，接收端清理缓存并报超时。
+
+### 接口
+
+```python
+from canbit import (
+    TransportSender, Receiver, ReceiveResult, TransportError,
+    make_first_frame, make_consecutive_frame, make_flow_control_frame,
+    parse_pci, PCI_FF, PCI_CF, PCI_FC, FS_CTS, FS_WAIT, FS_OVFLW,
+    FF_DATA_BYTES, CF_DATA_BYTES, SEQ_MOD, MAX_MESSAGE_BYTES,
+)
+
+sender = TransportSender(0x700, payload)          # 1..4095 字节
+receiver = Receiver(0x708, block_size=4, st_min=2, timeout=100)
+ff = sender.start(tick=0)                          # 首帧
+res = receiver.on_frame(ff, 0)                     # ReceiveResult(flow_frames, delivered)
+sender.on_frame(res.flow_frames[0], 0)             # 处理流控
+cf = sender.next_frame(tick)                       # 受块大小/st_min 约束，未就绪为 None
+receiver.on_tick(tick)                             # 推进逻辑时钟（超时检查）
+```
+
+失败抛 `TransportError`，`kind` ∈ `sequence / oversize / format /
+timeout / wait_exceeded / abort`；非法参数仍抛 `ValidationError`。
+测试与 `demo_iteration.py` 均用本地事件序列驱动两端，不经过真实总线，
+最终交付与固定生成的原始字节串逐字节独立核对。
+
 ## 输入上限与错误语义
 
 * ID ∈ [0, 2047]；DLC ∈ [0, 8]；数据长度必须等于 DLC（直接调用 CRC/payload
@@ -145,8 +205,11 @@ canbit/__init__.py     # 公开导出
 canbit/errors.py       # CanError/ValidationError/FrameDecodeError/BusFinishedError
 canbit/framing.py      # Frame/CRC15/位填充/整帧编码与解码
 canbit/bus.py          # BitBus：逐 bit 仲裁/位错误/ACK/错误帧
+canbit/transport.py    # 传输层：FF/CF/FC、发送端、接收端
 tests/test_framing.py  # CRC、填充、编解码测试（对照独立参考）
 tests/test_bus.py      # 仲裁/错误/ACK/契约/差分对拍测试
+tests/test_transport.py # 传输层：序号回绕/分块暂停/丢帧/超时等
 tests/reference.py     # 独立参考实现（不 import canbit）
-demo.py                # 固定输入演示
+demo.py                # 位流层固定输入演示
+demo_iteration.py      # 传输层演示（正常 + 边界，真实计算）
 ```
