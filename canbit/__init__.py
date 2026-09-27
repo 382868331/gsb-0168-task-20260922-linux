@@ -39,6 +39,15 @@ from .bus import (
     Sender,
     StepResult,
 )
+from .txqueue import (
+    ErrorRecord,
+    ExhaustedRecord,
+    PendingRecord,
+    QueueResult,
+    RoundRecord,
+    SentRecord,
+    TxQueue,
+)
 
 __all__ = [
     # 常量
@@ -57,6 +66,14 @@ __all__ = [
     "StepResult",
     "ErrorFrameInfo",
     "BusResult",
+    # 待发送队列
+    "TxQueue",
+    "SentRecord",
+    "PendingRecord",
+    "ExhaustedRecord",
+    "ErrorRecord",
+    "RoundRecord",
+    "QueueResult",
     # 编解码
     "compute_crc15",
     "payload_bits",

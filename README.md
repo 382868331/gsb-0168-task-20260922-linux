@@ -17,7 +17,7 @@
 ## 准确命令
 
 ```bash
-# 必要测试（37 个用例，实测 < 0.1s）
+# 必要测试（48 个用例，实测 < 0.1s）
 python -m unittest discover -s tests -v
 
 # 固定输入演示（实测约 0.04s，远小于 8s 预算；无 sleep、无预录结果）
@@ -82,6 +82,32 @@ result.error_frame         # None 或 ErrorFrameInfo(trigger, bit_index, partici
 bus.events                 # 每位时间的可审计 Event 序列
 ```
 
+待发送队列（仲裁失败者按原有规则重试）：
+
+```python
+from canbit import TxQueue, Sender, Frame
+
+queue = TxQueue(ack_pullers={"RX_node"})
+queue.enqueue(Sender("A", Frame(0x321, b"hi")), max_retries=3)
+queue.enqueue(Sender("B", Frame(0x320, b"yo")), max_retries=3)
+queue.cancel("A")            # 只取消仍在排队的帧，不影响正在发送的其他帧
+final = queue.run()          # 也可逐轮 queue.step_round()
+final.sent                   # SentRecord(name, frame, retries, round_index)
+final.pending                # 仍在等待（仅 max_rounds 截断时非空）
+final.exhausted              # ExhaustedRecord(name, frame, retries, max_retries)
+final.errors                 # ErrorRecord(name, frame, round_index, error_frame)
+```
+
+队列语义：
+
+* 每轮把队列中全部帧交给一个 `BitBus` 同时仲裁，胜者记 `sent` 并出队；
+  仲裁失败者 `retries` 只在**真正重新入队时**加 1，下一轮按原仲裁规则参与。
+* `retries == max_retries` 后再次仲裁失败即记 `exhausted`（最后这次失败
+  没有发生重试，故不计入 `retries`）；`max_retries=0` 表示首轮失败即耗尽。
+* 真正的传输错误（`bit_error`/`ack_error` 错误帧）与仲裁失败分开：被中止者
+  记 `errors`，**不消耗重试次数、不再重试**；同一轮已仲裁失败者照常重试。
+* `max_rounds` 可限制轮次；达到上限后剩余帧在结果中记为 `pending`。
+
 解码：
 
 ```python
@@ -132,7 +158,9 @@ NaN/Infinity）一律拒绝，不参与任何数值运算。测试中不存在�
 
 * 不是完整 CAN/CAN FD：无 RTR、IDE、保留位、控制场其余编码、远程帧、
   过载帧、帧间隙、位时序/同步、重同步跳转宽度。
-* 无重传、无主动/被动错误/总线关闭状态机、无错误界定符与错误计数。
+* 无 CAN 标准意义上的自动重传与帧间隙恢复：仅由 `TxQueue` 提供本题定义的
+  “仲裁失败后重新排队参与后续仲裁”；无主动/被动错误/总线关闭状态机、
+  无错误界定符与错误计数。
 * ACK 槽为 1 位模型，不区分 ACK 槽/界定符；EOF 为 1 位而非 7 位。
 * `forced_bits` 是测试/演示用的确定性故障注入钩子，不代表真实收发器行为。
 * DLC 仅 0..8；解码出 DLC>8 直接报 `protocol` 错误（不做经典 CAN 的
@@ -145,8 +173,10 @@ canbit/__init__.py     # 公开导出
 canbit/errors.py       # CanError/ValidationError/FrameDecodeError/BusFinishedError
 canbit/framing.py      # Frame/CRC15/位填充/整帧编码与解码
 canbit/bus.py          # BitBus：逐 bit 仲裁/位错误/ACK/错误帧
+canbit/txqueue.py      # TxQueue：待发送队列、仲裁失败重试、最终四分类记录
 tests/test_framing.py  # CRC、填充、编解码测试（对照独立参考）
 tests/test_bus.py      # 仲裁/错误/ACK/契约/差分对拍测试
+tests/test_txqueue.py  # 队列重试/错误分离/取消/记录分类测试
 tests/reference.py     # 独立参考实现（不 import canbit）
 demo.py                # 固定输入演示
 ```

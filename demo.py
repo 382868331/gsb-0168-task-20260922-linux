@@ -14,6 +14,7 @@ from canbit import (
     BitBus,
     Frame,
     Sender,
+    TxQueue,
     bit_stuff,
     compute_crc15,
     decode_frame,
@@ -134,9 +135,42 @@ def main() -> None:
         else:  # pragma: no cover - demo 不应走到这里
             raise AssertionError(f"illegal input was silently accepted: {label}")
 
+    # -----------------------------------------------------------------
+    # 场景 5：待发送队列 —— 仲裁失败者重试、错误分离、取消、最终分类
+    # -----------------------------------------------------------------
+    hr("场景 5（队列重试）：仲裁失败者按原规则重新参与仲裁")
+    queue = TxQueue(ack_pullers={"RX_node"})
+    queue.enqueue(Sender("ECU_A", Frame(0x321, b"A")), max_retries=5)
+    queue.enqueue(Sender("ECU_B", Frame(0x320, b"B")), max_retries=5)
+    queue.enqueue(Sender("ECU_C", Frame(0x0FF, b"C")), max_retries=5)
+    queue.enqueue(Sender("ECU_D", Frame(0x400, b"D")), max_retries=1)
+    print("排队 4 帧：ID 0x321/0x320/0x0FF（重试预算 5）与 0x400（预算 1）")
+    for rd in iter(queue.step_round, None):
+        print(f"  第 {rd.round_index + 1} 轮: 胜出={rd.sent or '-'} "
+              f"重新排队={rd.requeued or '-'} 耗尽={rd.exhausted or '-'}")
+    final = queue.result()
+    print("最终记录:")
+    print("  成功发送:", [(s.name, f"实际仲裁失败 {s.retries} 次")
+                         for s in final.sent])
+    print("  仍在等待:", [p.name for p in final.pending])
+    print("  重试耗尽:", [(e.name, f"实际重试 {e.retries} 次 / 预算 "
+                                   f"{e.max_retries}") for e in final.exhausted])
+    print("  传输错误:", [(e.name, e.error_frame.trigger) for e in final.errors])
+    print("-> ECU_D(0x400) 每轮都输，预算 1 用完即耗尽；仲裁失败与传输错误分开")
+
+    # 取消排队中的帧不影响其他帧
+    q2 = TxQueue(ack_pullers={"RX_node"})
+    q2.enqueue(Sender("ECU_A", Frame(0x321, b"A")))
+    q2.enqueue(Sender("ECU_B", Frame(0x320, b"B")))
+    removed = q2.cancel("ECU_A")
+    f2 = q2.run()
+    print(f"取消排队中的 ECU_A（实际移除={removed}）后，" 
+          f"ECU_B 正常发送: {[s.name for s in f2.sent]}")
+
     hr("演示结束")
     print("所有结果均为运行时真实计算；本模型仅实现本题契约子集，")
-    print("不包含重传、错误界定/被动错误计数等完整 CAN 机制。")
+    print("队列层仅实现本题定义的仲裁失败重试，不包含 CAN 标准的重传时序、")
+    print("错误界定/被动错误计数等完整机制。")
 
 
 if __name__ == "__main__":
