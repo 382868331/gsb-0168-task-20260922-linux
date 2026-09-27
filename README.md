@@ -4,8 +4,10 @@
 帧编码、CRC15、位填充、wired-AND 仲裁、位错误、显式 ACK 槽与错误帧中止。
 
 > **本库只实现题面契约定义的有限协议子集，不宣称兼容完整 CAN 标准**
-> （无 RTR/IDE/控制场其余位、无重传、无错误界定/被动错误计数、无位时序
-> 与同步、无错误界定符/帧间隙等）。
+> （无 RTR/IDE/控制场其余位、无错误界定/被动错误计数、无位时序
+> 与同步、无错误界定符/帧间隙等）。重传仅以「待发送队列 + 按原仲裁
+> 规则重新参与」的调度器形式提供（见 RetryScheduler），不实现 CAN 的
+> 自动重传状态机。
 
 ## 运行环境
 
@@ -17,7 +19,7 @@
 ## 准确命令
 
 ```bash
-# 必要测试（37 个用例，实测 < 0.1s）
+# 必要测试（51 个用例，实测 < 0.1s）
 python -m unittest discover -s tests -v
 
 # 固定输入演示（实测约 0.04s，远小于 8s 预算；无 sleep、无预录结果）
@@ -52,6 +54,8 @@ from canbit import (
     DecodedFrame,         # decode_frame 的产物（frame/crc/crc_ok）
     Sender,               # Sender(name:str, frame:Frame)
     BitBus, Event, StepResult, ErrorFrameInfo, BusResult,
+    # 重试调度
+    RetryScheduler, FrameRecord, RoundRecord, ScheduleReport,
     # 纯函数
     compute_crc15,        # (identifier, dlc, data) -> int 0..0x7FFF
     payload_bits,         # (identifier, dlc, data) -> list[int]
@@ -81,6 +85,32 @@ result.winners             # ('B',)
 result.error_frame         # None 或 ErrorFrameInfo(trigger, bit_index, participants, aborted)
 bus.events                 # 每位时间的可审计 Event 序列
 ```
+
+待发送队列与重试（多轮调度，复用同一 BitBus 仲裁规则）：
+
+```python
+sched = RetryScheduler(
+    [Sender("A", Frame(0x102, b"a")), Sender("B", Frame(0x100, b"b"))],
+    max_retries=2,                # 每帧重试上限（仲裁失败+传输错误合计）
+    ack_pullers={"RX"},           # 每轮沿用 BitBus 契约
+    forced_bits=None,             # dict 或 f(round_index)->dict，按轮故障注入
+)
+sched.enqueue(Sender("C", Frame(0x101, b"c")))   # 运行中也可入队新帧
+sched.cancel("C")                # 仅取消排队中的帧；发送中的帧返回 False 且不受影响
+report = sched.run()             # 推进到所有帧到达终态
+rec = report.records[0]
+rec.status                # sent 成功 | pending 仍在等待 | exhausted 重试耗尽
+                          # | cancelled 排队期间被取消
+rec.arbitration_retries   # 仲裁失败（ID 域发1读0）实际重试次数
+rec.error_retries         # 传输错误（bit_error/ack_error 错误帧中止）实际重试次数
+rec.attempts              # 实际参与的总线轮数
+report.rounds             # 每轮 RoundRecord（参与者/BitBus 结果/重排队/耗尽名单）
+```
+
+调度语义：**仲裁失败与真正的传输错误分开计数**，重试次数只按实际发生的
+情况累加；每轮失败者只要合计重试未超 max_retries 即重新入队，下一轮按
+原有仲裁规则再次参与，否则标记 exhausted 不再参与；cancel 只从等待队列
+移除，绝不影响正在发送的本轮帧。
 
 解码：
 
@@ -132,7 +162,9 @@ NaN/Infinity）一律拒绝，不参与任何数值运算。测试中不存在�
 
 * 不是完整 CAN/CAN FD：无 RTR、IDE、保留位、控制场其余编码、远程帧、
   过载帧、帧间隙、位时序/同步、重同步跳转宽度。
-* 无重传、无主动/被动错误/总线关闭状态机、无错误界定符与错误计数。
+* 无 CAN 自动重传状态机、无主动/被动错误/总线关闭状态机、无错误界定符
+  与错误计数；重试仅由 RetryScheduler 以「整轮重发」方式在总线模型之上
+  调度，单轮 BitBus 本身仍不重传。
 * ACK 槽为 1 位模型，不区分 ACK 槽/界定符；EOF 为 1 位而非 7 位。
 * `forced_bits` 是测试/演示用的确定性故障注入钩子，不代表真实收发器行为。
 * DLC 仅 0..8；解码出 DLC>8 直接报 `protocol` 错误（不做经典 CAN 的
@@ -145,8 +177,10 @@ canbit/__init__.py     # 公开导出
 canbit/errors.py       # CanError/ValidationError/FrameDecodeError/BusFinishedError
 canbit/framing.py      # Frame/CRC15/位填充/整帧编码与解码
 canbit/bus.py          # BitBus：逐 bit 仲裁/位错误/ACK/错误帧
+canbit/retry.py        # RetryScheduler：待发送队列与失败重试调度
 tests/test_framing.py  # CRC、填充、编解码测试（对照独立参考）
 tests/test_bus.py      # 仲裁/错误/ACK/契约/差分对拍测试
+tests/test_retry.py    # 重试队列、分类计数、取消与终态测试
 tests/reference.py     # 独立参考实现（不 import canbit）
 demo.py                # 固定输入演示
 ```

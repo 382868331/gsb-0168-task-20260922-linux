@@ -13,6 +13,7 @@
 from canbit import (
     BitBus,
     Frame,
+    RetryScheduler,
     Sender,
     bit_stuff,
     compute_crc15,
@@ -133,6 +134,43 @@ def main() -> None:
             print(f"  拒绝 [{label}] -> {type(exc).__name__}: {exc}")
         else:  # pragma: no cover - demo 不应走到这里
             raise AssertionError(f"illegal input was silently accepted: {label}")
+
+    # -----------------------------------------------------------------
+    # 场景 5：待发送队列 —— 仲裁失败者按原规则重试，终态分类记录
+    # -----------------------------------------------------------------
+    hr("场景 5（重试队列）：仲裁失败重新排队，错误与仲裁分开计数")
+    sched = RetryScheduler(
+        [
+            Sender("ECU_A", Frame(0x102, b"A")),
+            Sender("ECU_B", Frame(0x100, b"B")),
+            Sender("ECU_C", Frame(0x101, b"C")),
+        ],
+        max_retries=2,
+        ack_pullers={"RX_node"},
+    )
+    print("三个发送者同时待发送（ID 0x102/0x100/0x101），max_retries=2：")
+    while not sched.finished:
+        sched.step()
+    for rnd in sched.rounds:
+        print(f"  第{rnd.round_index}轮: 参与者={rnd.participants} "
+              f"胜者={rnd.result.winners} 重排队={rnd.requeued} 耗尽={rnd.exhausted}")
+    for rec in sched.records:
+        print(f"  {rec.name}: status={rec.status} attempts={rec.attempts} "
+              f"仲裁重试={rec.arbitration_retries} 错误重试={rec.error_retries}")
+
+    print("取消只影响排队中的帧：")
+    sched2 = RetryScheduler(
+        [Sender("X", Frame(0x100, b"x")), Sender("Y", Frame(0x101, b"y"))],
+        max_retries=1,
+        ack_pullers={"RX_node"},
+    )
+    sched2.step()  # 第一轮开始，X/Y 均在发送中
+    print(f"  取消发送中的 X -> {sched2.cancel('X')}（不受影响，本轮照常完成）")
+    sched2.enqueue(Sender("Z", Frame(0x102, b"z")))
+    print(f"  取消排队中的 Z -> {sched2.cancel('Z')}")
+    sched2.run()
+    for rec in sched2.records:
+        print(f"  {rec.name}: status={rec.status} attempts={rec.attempts}")
 
     hr("演示结束")
     print("所有结果均为运行时真实计算；本模型仅实现本题契约子集，")

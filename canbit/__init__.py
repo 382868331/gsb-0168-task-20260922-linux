@@ -39,6 +39,12 @@ from .bus import (
     Sender,
     StepResult,
 )
+from .retry import (
+    FrameRecord,
+    RetryScheduler,
+    RoundRecord,
+    ScheduleReport,
+)
 
 __all__ = [
     # 常量
@@ -57,6 +63,10 @@ __all__ = [
     "StepResult",
     "ErrorFrameInfo",
     "BusResult",
+    # 重试调度
+    "FrameRecord",
+    "RoundRecord",
+    "ScheduleReport",
     # 编解码
     "compute_crc15",
     "payload_bits",
@@ -66,6 +76,7 @@ __all__ = [
     "decode_frame",
     # 总线
     "BitBus",
+    "RetryScheduler",
     # 异常
     "CanError",
     "ValidationError",
